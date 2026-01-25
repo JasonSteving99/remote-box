@@ -10,8 +10,9 @@ from remote.backends import (
     BackendType,
     SHELL_EXECUTABLES,
     AnyBackendConfig,
+    Backend,
 )
-from remote.backends import subprocess as subprocess_backend
+from remote.backends.subprocess import SubprocessBackend
 
 # Load the execution harness template
 _HARNESS_TEMPLATE_PATH = Path(__file__).parent / "execution_harness.sh.tmpl"
@@ -48,10 +49,15 @@ if __name__ == "__main__":
 
 """
 
-# Map backend type to execution functions
-_BACKEND_EXECUTORS = {
-    BackendType.SUBPROCESS: subprocess_backend.execute,
+# Registry mapping backend types to their implementations
+_BACKEND_REGISTRY: dict[BackendType, type[Backend]] = {
+    BackendType.SUBPROCESS: SubprocessBackend,
 }
+
+# Cache to track which backend configurations have been pre-checked
+# Uses list since Pydantic models aren't hashable but support equality comparison.
+# Checking such a short list is likely just as (or more) efficient than checking a set anyways.
+_PRECHECKED_CONFIGS: list[AnyBackendConfig] = []
 
 
 def remote[I: BaseModel, O: BaseModel](
@@ -86,6 +92,14 @@ def remote[I: BaseModel, O: BaseModel](
         async def my_function(input: InputModel) -> OutputModel:
             return OutputModel(greeting=f"Hello {input.name}")
     """
+    # Get the backend implementation from the registry
+    backend_impl = _BACKEND_REGISTRY[backend.type]
+
+    # Run pre-checks when the decorator is first applied (at import time)
+    # Only run once per unique backend configuration for performance
+    if backend not in _PRECHECKED_CONFIGS:
+        backend_impl.pre_check(backend)
+        _PRECHECKED_CONFIGS.append(backend)
 
     def decorator(
         func: Callable[[I], Coroutine[Any, Any, O]],
@@ -94,8 +108,6 @@ def remote[I: BaseModel, O: BaseModel](
         # For async functions, the annotation is the output type directly (not wrapped in Coroutine)
         output_model_class = inspect.get_annotations(func)["return"]
 
-        # Get the backend executor function based on backend type
-        backend_executor = _BACKEND_EXECUTORS[backend.type]
         backend_shell = SHELL_EXECUTABLES[backend.shell]
 
         async def wrapper(arg: I) -> O:
@@ -115,7 +127,7 @@ def remote[I: BaseModel, O: BaseModel](
             bash_script = _HARNESS_TEMPLATE.format(shell=backend_shell, code=python_code)
 
             # Execute using the configured backend with timeout
-            return await backend_executor(bash_script, output_model_class, timeout_millis)
+            return await backend_impl.execute(bash_script, output_model_class, timeout_millis)
 
         return wrapper
 
