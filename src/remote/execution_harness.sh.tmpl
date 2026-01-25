@@ -1,5 +1,6 @@
-#!/bin/zsh
-# Note: Using zsh instead of bash for dynamic FD support on macOS (bash 3.2 doesn't support it)
+#!/usr/bin/env {shell}
+# Cross-platform harness: requires bash 4+ or zsh for dynamic FD assignment support
+# (macOS default bash 3.2 doesn't support dynamic FDs, hence the configurable shell)
 
 # This script exists to ensure that the arbitrary python code we end up
 # executing remotely can communicate its response on a unique FD to avoid any
@@ -7,12 +8,12 @@
 # This is a standard IPC problem where you need some solution to avoid the
 # communication between processes getting conflated with other stdout.
 
-# 1. Create a unique named pipe (FIFO)
-PIPE_PATH="/tmp/remote_execution_ipc_pipe"
+# 1. Create a unique named pipe (FIFO) with PID to avoid conflicts
+PIPE_PATH="/tmp/remote_execution_ipc_pipe_$$"
 [ -p "$PIPE_PATH" ] || mkfifo "$PIPE_PATH"
 
 # Ensure cleanup happens even if the script fails or is interrupted
-trap 'rm "$PIPE_PATH"' EXIT
+trap 'rm -f "$PIPE_PATH"' EXIT INT TERM
 
 # 2. Open the pipe for reading/writing on a dynamic File Descriptor
 # This ensures the pipe doesn't "close" when Python finishes writing

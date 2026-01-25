@@ -4,7 +4,13 @@ import inspect
 from pathlib import Path
 import os
 
-from remote.backends import Backend
+from remote.backends import (
+    Subprocess,
+    BackendShell,
+    BackendType,
+    SHELL_EXECUTABLES,
+    AnyBackendConfig,
+)
 from remote.backends import subprocess as subprocess_backend
 
 # Load the execution harness template
@@ -42,15 +48,15 @@ if __name__ == "__main__":
 
 """
 
-# Map Backend enum to execution functions
+# Map backend type to execution functions
 _BACKEND_EXECUTORS = {
-    Backend.SUBPROCESS: subprocess_backend.execute,
+    BackendType.SUBPROCESS: subprocess_backend.execute,
 }
 
 
 def remote[I: BaseModel, O: BaseModel](
     local_project_root: Path,
-    backend: Backend = Backend.SUBPROCESS,
+    backend: AnyBackendConfig = Subprocess(shell=BackendShell.ZSH),
     timeout_millis: int = 300000,  # 5 minutes default
 ) -> Callable[[Callable[[I], Coroutine[Any, Any, O]]], Callable[[I], Coroutine[Any, Any, O]]]:
     """
@@ -62,7 +68,7 @@ def remote[I: BaseModel, O: BaseModel](
 
     Args:
         local_project_root: Root directory of the project for resolving imports
-        backend: Backend to use for remote execution (default: Backend.SUBPROCESS)
+        backend: Backend configuration (default: Subprocess with ZSH for macOS compatibility)
         timeout_millis: Maximum execution time in milliseconds (default: 300000 = 5 minutes)
 
     Usage:
@@ -72,7 +78,11 @@ def remote[I: BaseModel, O: BaseModel](
         class OutputModel(BaseModel):
             greeting: str
 
-        @remote(local_project_root=Path(__file__).parent, timeout_millis=60000)
+        @remote(
+            local_project_root=Path(__file__).parent,
+            backend=Subprocess(shell=BackendShell.BASH4),
+            timeout_millis=60000
+        )
         async def my_function(input: InputModel) -> OutputModel:
             return OutputModel(greeting=f"Hello {input.name}")
     """
@@ -84,8 +94,9 @@ def remote[I: BaseModel, O: BaseModel](
         # For async functions, the annotation is the output type directly (not wrapped in Coroutine)
         output_model_class = inspect.get_annotations(func)["return"]
 
-        # Get the backend executor function
-        backend_executor = _BACKEND_EXECUTORS[backend]
+        # Get the backend executor function based on backend type
+        backend_executor = _BACKEND_EXECUTORS[backend.type]
+        backend_shell = SHELL_EXECUTABLES[backend.shell]
 
         async def wrapper(arg: I) -> O:
             # If we're already in remote execution mode, just call the function directly
@@ -101,7 +112,7 @@ def remote[I: BaseModel, O: BaseModel](
             )
 
             # Wrap the Python code in the execution harness bash script
-            bash_script = _HARNESS_TEMPLATE.format(code=python_code)
+            bash_script = _HARNESS_TEMPLATE.format(shell=backend_shell, code=python_code)
 
             # Execute using the configured backend with timeout
             return await backend_executor(bash_script, output_model_class, timeout_millis)
