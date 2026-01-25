@@ -1,0 +1,34 @@
+#!/bin/zsh
+# Note: Using zsh instead of bash for dynamic FD support on macOS (bash 3.2 doesn't support it)
+
+# This script exists to ensure that the arbitrary python code we end up
+# executing remotely can communicate its response on a unique FD to avoid any
+# accidental collisions on stdout with logs the user code may have emitted.
+# This is a standard IPC problem where you need some solution to avoid the
+# communication between processes getting conflated with other stdout.
+
+# 1. Create a unique named pipe (FIFO)
+PIPE_PATH="/tmp/remote_execution_ipc_pipe"
+[ -p "$PIPE_PATH" ] || mkfifo "$PIPE_PATH"
+
+# Ensure cleanup happens even if the script fails or is interrupted
+trap 'rm "$PIPE_PATH"' EXIT
+
+# 2. Open the pipe for reading/writing on a dynamic File Descriptor
+# This ensures the pipe doesn't "close" when Python finishes writing
+exec {{IPC_FD}}<>"$PIPE_PATH"
+
+# 3. Launch Python and pass the FD number as an env var
+# We redirect Python's stdout to /dev/null using '1>/dev/null'
+# This isolates the Python logic from this Bash script's output.
+# Set REMOTE_EXECUTION_MODE to prevent recursively triggering unlimited remote work.
+REMOTE_EXECUTION_MODE=1 REMOTE_EXECUTION_IPC_FD=$IPC_FD uv run python 1>/dev/null <<'EOF'
+{code}
+EOF
+
+# 4. Read the result from the specific FD (-u flag) and print JUST that output to stdout.
+read -u "$IPC_FD" RESULT
+echo "$RESULT"
+
+# 5. Close the FD (cleanup handled by trap)
+exec {{IPC_FD}}>&-
