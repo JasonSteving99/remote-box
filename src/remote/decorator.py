@@ -13,6 +13,7 @@ from remote.backends import (
     Backend,
 )
 from remote.backends.subprocess import SubprocessBackend
+from remote.backends.e2b import E2BBackend
 
 # Load the execution harness template
 _HARNESS_TEMPLATE_PATH = Path(__file__).parent / "execution_harness.sh.tmpl"
@@ -52,6 +53,7 @@ if __name__ == "__main__":
 # Registry mapping backend types to their implementations
 _BACKEND_REGISTRY: dict[BackendType, type[Backend]] = {
     BackendType.SUBPROCESS: SubprocessBackend,
+    BackendType.E2B: E2BBackend,
 }
 
 # Cache to track which backend configurations have been pre-checked
@@ -96,9 +98,10 @@ def remote[I: BaseModel, O: BaseModel](
     backend_impl = _BACKEND_REGISTRY[backend.type]
 
     # Run pre-checks when the decorator is first applied (at import time)
+    # Skip pre-checks if we're already in remote execution mode
     # Only run once per unique backend configuration for performance
-    if backend not in _PRECHECKED_CONFIGS:
-        backend_impl.pre_check(backend)
+    if os.environ.get("REMOTE_EXECUTION_MODE") != "1" and backend not in _PRECHECKED_CONFIGS:
+        backend_impl.pre_check(backend, local_project_root)
         _PRECHECKED_CONFIGS.append(backend)
 
     def decorator(
@@ -127,7 +130,9 @@ def remote[I: BaseModel, O: BaseModel](
             bash_script = _HARNESS_TEMPLATE.format(shell=backend_shell, code=python_code)
 
             # Execute using the configured backend with timeout
-            return await backend_impl.execute(bash_script, output_model_class, timeout_millis)
+            return await backend_impl.execute(
+                backend, local_project_root, bash_script, output_model_class, timeout_millis
+            )
 
         return wrapper
 

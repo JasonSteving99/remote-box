@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 from pydantic import BaseModel
 from remote.backends import AnyBackendConfig, Subprocess, SHELL_EXECUTABLES, BackendShell
 import shutil
@@ -10,12 +11,13 @@ class SubprocessBackend:
     """Backend implementation for local subprocess execution."""
 
     @staticmethod
-    def pre_check(config: AnyBackendConfig) -> None:
+    def pre_check(config: AnyBackendConfig, local_project_root: Path) -> None:
         """
         Verify that the required shell is available and supports dynamic FD assignment.
 
         Args:
             config: Backend configuration (must be Subprocess config)
+            local_project_root: Path to the local project root directory
 
         Raises:
             RuntimeError: If the configured shell is not found or doesn't support required features
@@ -67,6 +69,8 @@ class SubprocessBackend:
 
     @staticmethod
     async def execute[O: BaseModel](
+        config: AnyBackendConfig,
+        local_project_root: Path,
         bash_script: str,
         output_model_class: type[O],
         timeout_millis: int,
@@ -75,6 +79,8 @@ class SubprocessBackend:
         Execute the remote function in a subprocess and return the parsed result.
 
         Args:
+            config: The backend configuration
+            local_project_root: Path to the local project root directory
             bash_script: Fully formatted bash script to execute (including execution harness)
             output_model_class: The Pydantic model class to parse the output
             timeout_millis: Maximum time to wait for execution in milliseconds
@@ -86,10 +92,14 @@ class SubprocessBackend:
             TimeoutError: If execution exceeds timeout_millis
             Exception: If execution fails with non-zero exit code
         """
-        # Execute with zsh explicitly to support {IPC_FD} dynamic file descriptors
-        # (bash 3.2 on macOS doesn't support this feature, but zsh does)
+        if not isinstance(config, Subprocess):
+            raise TypeError(f"SubprocessBackend requires Subprocess config, got {type(config)}")
+
+        shell_executable = SHELL_EXECUTABLES[config.shell]
+
+        # Execute with the configured shell to support {IPC_FD} dynamic file descriptors
         process = await asyncio.create_subprocess_exec(
-            "zsh",
+            shell_executable,
             "-c",
             bash_script,
             stdout=asyncio.subprocess.PIPE,

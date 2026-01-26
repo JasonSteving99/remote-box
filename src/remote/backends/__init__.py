@@ -1,12 +1,14 @@
 from enum import Enum, auto
+from pathlib import Path
 from pydantic import BaseModel, Field
-from typing import Literal, Protocol, Any, Coroutine
+from typing import Literal, Optional, Protocol, Any, Coroutine
 
 
 class BackendType(Enum):
     """Backend type identifiers."""
 
     SUBPROCESS = auto()
+    E2B = auto()
     # Future: UBUNTU = "ubuntu", SSH = "ssh", etc.
 
 
@@ -28,6 +30,7 @@ class BackendConfig[T: BackendType](BaseModel):
     """Base class for backend configurations."""
 
     type: T = Field(..., description="Backend type discriminator")
+    shell: BackendShell = Field(..., description="Shell to use for execution harness")
 
 
 class Subprocess(BackendConfig[Literal[BackendType.SUBPROCESS]]):
@@ -37,16 +40,47 @@ class Subprocess(BackendConfig[Literal[BackendType.SUBPROCESS]]):
     shell: BackendShell = Field(..., description="Shell to use for execution harness")
 
 
+class E2B(BackendConfig[Literal[BackendType.E2B]]):
+    """Configuration for E2B backend execution."""
+
+    type: Literal[BackendType.E2B] = BackendType.E2B
+    shell: BackendShell = BackendShell.BASH4
+    e2b_api_key: Optional[str] = Field(
+        default=None,
+        description="API key for E2B backend. If this isn't set, it must be provided via environment variable `E2B_API_KEY`.",
+    )
+    template_prefix: str = Field(
+        ...,
+        description="Prefix for E2B template naming. Full template alias will be '{prefix}-v{version}'.",
+    )
+    template_version: Optional[str] = Field(
+        default=None,
+        description="Version to use for template naming. If not provided, reads project's pyproject.toml version.",
+    )
+    dockerfile_path: Optional[str] = Field(
+        default=None,
+        description="Path to Dockerfile for E2B backend, if any. If not provided will look for `Dockerfile` in local project root.",
+    )
+    cpu_count: int = Field(
+        default=1,
+        description="Number of CPUs to allocate for the E2B sandbox.",
+    )
+    memory_mb: int = Field(
+        default=1024,
+        description="Amount of memory in MB to allocate for the E2B sandbox.",
+    )
+
+
 # Type alias for all backend configs (discriminated union)
 # Add new backend configs here as they're implemented
-AnyBackendConfig = Subprocess
+AnyBackendConfig = Subprocess | E2B
 
 
 class Backend(Protocol):
     """Protocol that all backend implementations must follow."""
 
     @staticmethod
-    def pre_check(config: AnyBackendConfig) -> None:
+    def pre_check(config: AnyBackendConfig, local_project_root: Path) -> None:
         """
         Run pre-checks when the decorator is first applied.
 
@@ -61,6 +95,7 @@ class Backend(Protocol):
 
         Args:
             config: The backend configuration
+            local_project_root: Path to the local project root directory
 
         Raises:
             Exception: If pre-checks fail (e.g., missing API key, invalid config)
@@ -69,6 +104,8 @@ class Backend(Protocol):
 
     @staticmethod
     async def execute[O: BaseModel](
+        config: AnyBackendConfig,
+        local_project_root: Path,
         bash_script: str,
         output_model_class: type[O],
         timeout_millis: int,
@@ -77,6 +114,8 @@ class Backend(Protocol):
         Execute the remote function and return the parsed result.
 
         Args:
+            config: The backend configuration
+            local_project_root: Path to the local project root directory
             bash_script: Fully formatted bash script to execute (including execution harness)
             output_model_class: The Pydantic model class to parse the output
             timeout_millis: Maximum time to wait for execution in milliseconds
