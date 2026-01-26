@@ -3,6 +3,7 @@ from pydantic import BaseModel
 import inspect
 from pathlib import Path
 import os
+import functools
 
 from remote.backends import (
     Subprocess,
@@ -113,6 +114,7 @@ def remote[I: BaseModel, O: BaseModel](
 
         backend_shell = SHELL_EXECUTABLES[backend.shell]
 
+        @functools.wraps(func)
         async def wrapper(arg: I) -> O:
             # If we're already in remote execution mode, just call the function directly
             if os.environ.get("REMOTE_EXECUTION_MODE") == "1":
