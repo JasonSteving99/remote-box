@@ -11,3 +11,6 @@ wheels/
 
 .env.local
 .env
+
+# Generated data files
+data/synthetic_access.log

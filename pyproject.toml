@@ -1,15 +1,33 @@
 [project]
-name = "supercomputer"
+name = "remote-box"
 version = "0.1.0"
-description = "Add your description here"
+description = "Type-safe remote Python function execution framework with multiple backend support"
 readme = "README.md"
-requires-python = "==3.12.*"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [
+    { name = "Jason Steving" }
+]
+keywords = ["remote", "execution", "distributed", "async", "pydantic"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Distributed Computing",
+]
 dependencies = [
-    "asyncclick>=8.3.0.3",
     "e2b-code-interpreter>=2.4.1",
     "pydantic>=2.12.5",
     "python-dotenv>=1.2.1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/JasonSteving99/remote-box"
+Repository = "https://github.com/JasonSteving99/remote-box"
+Issues = "https://github.com/JasonSteving99/remote-box/issues"
 
 [build-system]
 requires = ["hatchling"]
@@ -17,6 +35,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/remote"]
+artifacts = ["src/remote/*.tmpl"]
+exclude = [
+    "src/remote/test_*.py",
+]
 
 [dependency-groups]
 dev = [
