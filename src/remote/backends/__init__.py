@@ -76,6 +76,28 @@ class E2B(BackendConfig[Literal[BackendType.E2B]]):
 AnyBackendConfig = Subprocess | E2B
 
 
+class RemoteExecutionErrorResponse(BaseModel):
+    """Response model for remote execution errors."""
+
+    __remote_execution_error__: Literal[True]
+    error_type: str
+    error_message: str
+    # traceback: str
+
+
+class RemoteExecutionError(Exception):
+    """Exception raised when remote execution fails with an error."""
+
+    def __init__(self, error_response: RemoteExecutionErrorResponse):
+        self.error_type = error_response.error_type
+        self.error_message = error_response.error_message
+        # self.remote_traceback = error_response.traceback
+        super().__init__(
+            f"Remote execution failed with {self.error_type}: {self.error_message}\n"
+            # f"Remote traceback:\n{self.remote_traceback}"
+        )
+
+
 class Backend(Protocol):
     """Protocol that all backend implementations must follow."""
 
@@ -103,25 +125,23 @@ class Backend(Protocol):
         ...
 
     @staticmethod
-    async def execute[O: BaseModel](
+    async def execute(
         config: AnyBackendConfig,
         local_project_root: Path,
         bash_script: str,
-        output_model_class: type[O],
         timeout_millis: int,
-    ) -> O:
+    ) -> str:
         """
-        Execute the remote function and return the parsed result.
+        Execute the remote function and return the raw stdout.
 
         Args:
             config: The backend configuration
             local_project_root: Path to the local project root directory
             bash_script: Fully formatted bash script to execute (including execution harness)
-            output_model_class: The Pydantic model class to parse the output
             timeout_millis: Maximum time to wait for execution in milliseconds
 
         Returns:
-            Parsed output model instance
+            Raw stdout from execution as string
 
         Raises:
             TimeoutError: If execution exceeds timeout_millis

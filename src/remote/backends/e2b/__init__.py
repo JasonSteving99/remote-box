@@ -1,6 +1,5 @@
 import os
 from pathlib import Path
-from pydantic import BaseModel
 from remote.backends import E2B, AnyBackendConfig
 from e2b import Template, default_build_logger, wait_for_timeout, AsyncSandbox
 import tomllib
@@ -170,29 +169,27 @@ class E2BBackend:
             logger.info(f"E2B template '{template_alias}' successfully built and deployed.")
 
     @staticmethod
-    async def execute[O: BaseModel](
+    async def execute(
         config: AnyBackendConfig,
         local_project_root: Path,
         bash_script: str,
-        output_model_class: type[O],
         timeout_millis: int,
-    ) -> O:
+    ) -> str:
         """
-        Execute bash script in E2B sandbox and return parsed output.
+        Execute bash script in E2B sandbox and return raw stdout.
 
         Args:
             config: E2B backend configuration
             local_project_root: Path to the local project root
             bash_script: Bash script to execute in the sandbox
-            output_model_class: Pydantic model class for parsing output
             timeout_millis: Maximum execution time in milliseconds
 
         Returns:
-            Parsed output as instance of output_model_class
+            Raw stdout from execution as string
 
         Raises:
             TypeError: If config is not E2B config
-            ValueError: If execution fails or output cannot be parsed
+            ValueError: If execution fails
         """
         if not isinstance(config, E2B):
             raise TypeError(f"E2BBackend requires E2B config, got {type(config)}")
@@ -223,14 +220,7 @@ class E2BBackend:
                     f"stderr: {result.stderr}"
                 )
 
-            # Parse the JSON output and validate against the output model
-            try:
-                return output_model_class.model_validate_json(result.stdout)
-            except Exception as e:
-                raise ValueError(
-                    f"Failed to parse and validate output against {output_model_class.__name__}: {e}\n"
-                    f"stdout: {result.stdout}"
-                )
+            return result.stdout
 
         finally:
             # Always kill the sandbox to avoid resource leaks

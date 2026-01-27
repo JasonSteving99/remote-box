@@ -1,5 +1,5 @@
 from typing import Any, Callable, Coroutine
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 import inspect
 from pathlib import Path
 import os
@@ -12,6 +12,8 @@ from remote.backends import (
     SHELL_EXECUTABLES,
     AnyBackendConfig,
     Backend,
+    RemoteExecutionErrorResponse,
+    RemoteExecutionError,
 )
 from remote.backends.subprocess import SubprocessBackend
 from remote.backends.e2b import E2BBackend
@@ -25,13 +27,20 @@ EXECUTION_TEMPLATE = """
 {import_func}
 
 import asyncio
+import json
 import os
 import sys
+import traceback
+
+def _write_to_ipc(ipc_fd: int, data: str):
+    \"\"\"Write data to IPC FD. Uses dup() to avoid closing the original FD.\"\"\"
+    # dup() the FD so fdopen doesn't close the original when the file object is closed
+    fd_copy = os.dup(ipc_fd)
+    with os.fdopen(fd_copy, 'w') as f:
+        print(data, file=f)
 
 async def execute():
-    res = await {func_name}({arg})
-
-    # Get the IPC FD from environment variable (required)
+    # Get the IPC FD early so we can report errors through it
     ipc_fd_str = os.environ.get('REMOTE_EXECUTION_IPC_FD')
     if not ipc_fd_str:
         print("Error: REMOTE_EXECUTION_IPC_FD environment variable not set", file=sys.stderr)
@@ -39,11 +48,23 @@ async def execute():
 
     try:
         ipc_fd = int(ipc_fd_str)
-        # Write to the IPC FD instead of stdout to avoid collisions with any logging the user code might do.
-        with os.fdopen(ipc_fd, 'w') as f:
-            print(res.model_dump_json(), file=f)
-    except (OSError, ValueError) as e:
-        print(f"Error: Failed to write to IPC FD {{ipc_fd_str}}: {{e}}", file=sys.stderr)
+    except ValueError as e:
+        print(f"Error: Invalid IPC FD value '{{ipc_fd_str}}': {{e}}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        res = await {func_name}({arg})
+        _write_to_ipc(ipc_fd, res.model_dump_json())
+    except Exception as e:
+        # Always write to IPC FD so the shell doesn't hang
+        error_response = json.dumps({{
+            "__remote_execution_error__": True,
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            # "traceback": traceback.format_exc()
+        }})
+        _write_to_ipc(ipc_fd, error_response)
+        print(f"Remote execution failed: {{e}}", file=sys.stderr)
         sys.exit(1)
 
 if __name__ == "__main__":
@@ -132,9 +153,17 @@ def remote[I: BaseModel, O: BaseModel](
             bash_script = _HARNESS_TEMPLATE.format(shell=backend_shell, code=python_code)
 
             # Execute using the configured backend with timeout
-            return await backend_impl.execute(
-                backend, local_project_root, bash_script, output_model_class, timeout_millis
+            stdout_str = await backend_impl.execute(
+                backend, local_project_root, bash_script, timeout_millis
             )
+
+            # Parse the response, trying happy path first
+            try:
+                return output_model_class.model_validate_json(stdout_str)
+            except ValidationError:
+                # If that fails, try parsing as error response
+                error_response = RemoteExecutionErrorResponse.model_validate_json(stdout_str)
+                raise RemoteExecutionError(error_response)
 
         return wrapper
 

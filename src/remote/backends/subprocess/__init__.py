@@ -1,7 +1,11 @@
 import asyncio
 from pathlib import Path
-from pydantic import BaseModel
-from remote.backends import AnyBackendConfig, Subprocess, SHELL_EXECUTABLES, BackendShell
+from remote.backends import (
+    AnyBackendConfig,
+    Subprocess,
+    SHELL_EXECUTABLES,
+    BackendShell,
+)
 import shutil
 import subprocess
 import re
@@ -68,25 +72,23 @@ class SubprocessBackend:
                 raise RuntimeError(f"Failed to verify zsh installation: {e}")
 
     @staticmethod
-    async def execute[O: BaseModel](
+    async def execute(
         config: AnyBackendConfig,
         local_project_root: Path,
         bash_script: str,
-        output_model_class: type[O],
         timeout_millis: int,
-    ) -> O:
+    ) -> str:
         """
-        Execute the remote function in a subprocess and return the parsed result.
+        Execute the remote function in a subprocess and return the raw stdout.
 
         Args:
             config: The backend configuration
             local_project_root: Path to the local project root directory
             bash_script: Fully formatted bash script to execute (including execution harness)
-            output_model_class: The Pydantic model class to parse the output
             timeout_millis: Maximum time to wait for execution in milliseconds
 
         Returns:
-            Parsed output model instance
+            Raw stdout from execution as string
 
         Raises:
             TimeoutError: If execution exceeds timeout_millis
@@ -135,4 +137,4 @@ class SubprocessBackend:
             # the stack trace can be used as if it were called locally.
             raise Exception(f"Error executing remotely!: {stderr.decode()}")
 
-        return output_model_class.model_validate_json(stdout.decode())
+        return stdout.decode()
