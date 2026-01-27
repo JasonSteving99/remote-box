@@ -28,7 +28,7 @@ REMOTE_EXECUTION_MODE=1 REMOTE_EXECUTION_IPC_FD=$IPC_FD uv run python 1>/dev/nul
 EOF
 
 # 4. Read the result from the specific FD (-u flag) and print JUST that output to stdout.
-read -u "$IPC_FD" RESULT
+read -r -u "$IPC_FD" RESULT
 echo "$RESULT"
 
 # 5. Close the FD (cleanup handled by trap)
