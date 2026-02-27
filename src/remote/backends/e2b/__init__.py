@@ -91,6 +91,8 @@ def _get_template_alias(
 class E2BBackend:
     """Backend implementation for E2B sandbox execution."""
 
+    PYTHON_CMD: str = "/app/.venv/bin/python"
+
     @staticmethod
     def pre_check(config: AnyBackendConfig, local_project_root: Path) -> None:
         """

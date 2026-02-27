@@ -14,6 +14,8 @@ import re
 class SubprocessBackend:
     """Backend implementation for local subprocess execution."""
 
+    PYTHON_CMD: str = "uv run python"
+
     @staticmethod
     def pre_check(config: AnyBackendConfig, local_project_root: Path) -> None:
         """

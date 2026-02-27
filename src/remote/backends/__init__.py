@@ -9,6 +9,7 @@ class BackendType(Enum):
 
     SUBPROCESS = auto()
     E2B = auto()
+    DAYTONA = auto()
     # Future: UBUNTU = "ubuntu", SSH = "ssh", etc.
 
 
@@ -71,9 +72,44 @@ class E2B(BackendConfig[Literal[BackendType.E2B]]):
     )
 
 
+class Daytona(BackendConfig[Literal[BackendType.DAYTONA]]):
+    """Configuration for Daytona backend execution."""
+
+    type: Literal[BackendType.DAYTONA] = BackendType.DAYTONA
+    shell: BackendShell = BackendShell.BASH4
+    daytona_api_key: Optional[str] = Field(
+        default=None,
+        description="API key for Daytona backend. If not set, must be provided via environment variable `DAYTONA_API_KEY`.",
+    )
+    snapshot_name: str = Field(
+        ...,
+        description="Prefix for Daytona snapshot naming. Full snapshot name will be '{snapshot_name}-v{version}'.",
+    )
+    snapshot_version: Optional[str] = Field(
+        default=None,
+        description="Version to use for snapshot naming. If not provided, reads project's pyproject.toml version.",
+    )
+    dockerfile_path: Optional[str] = Field(
+        default=None,
+        description="Path to Dockerfile for Daytona backend. If not provided will look for `Dockerfile` in local project root.",
+    )
+    cpu_count: int = Field(
+        default=1,
+        description="Number of CPUs to allocate for the Daytona sandbox.",
+    )
+    memory_gb: int = Field(
+        default=1,
+        description="Amount of memory in GB to allocate for the Daytona sandbox.",
+    )
+    disk_gb: int = Field(
+        default=3,
+        description="Amount of disk space in GB to allocate for the Daytona sandbox.",
+    )
+
+
 # Type alias for all backend configs (discriminated union)
 # Add new backend configs here as they're implemented
-AnyBackendConfig = Subprocess | E2B
+AnyBackendConfig = Subprocess | E2B | Daytona
 
 
 class RemoteExecutionErrorResponse(BaseModel):
@@ -100,6 +136,8 @@ class RemoteExecutionError(Exception):
 
 class Backend(Protocol):
     """Protocol that all backend implementations must follow."""
+
+    PYTHON_CMD: str
 
     @staticmethod
     def pre_check(config: AnyBackendConfig, local_project_root: Path) -> None:

@@ -11,6 +11,7 @@ from remote.backends import (
     BackendConfig,
     Subprocess,
     E2B,
+    Daytona,
     AnyBackendConfig,
     RemoteExecutionError,
     RemoteExecutionErrorResponse,
@@ -25,6 +26,7 @@ __all__ = [
     "BackendConfig",
     "Subprocess",
     "E2B",
+    "Daytona",
     "AnyBackendConfig",
     # Exceptions
     "RemoteExecutionError",

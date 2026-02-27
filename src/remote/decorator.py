@@ -17,53 +17,40 @@ from remote.backends import (
 )
 from remote.backends.subprocess import SubprocessBackend
 from remote.backends.e2b import E2BBackend
+from remote.backends.daytona import DaytonaBackend
 
 # Load the execution harness template
 _HARNESS_TEMPLATE_PATH = Path(__file__).parent / "execution_harness.sh.tmpl"
 _HARNESS_TEMPLATE = _HARNESS_TEMPLATE_PATH.read_text()
 
 EXECUTION_TEMPLATE = """
-{import_model}
-{import_func}
-
 import asyncio
 import json
 import os
 import sys
-import traceback
 
-def _write_to_ipc(ipc_fd: int, data: str):
-    \"\"\"Write data to IPC FD. Uses dup() to avoid closing the original FD.\"\"\"
-    # dup() the FD so fdopen doesn't close the original when the file object is closed
-    fd_copy = os.dup(ipc_fd)
-    with os.fdopen(fd_copy, 'w') as f:
+def _write_result(result_file: str, data: str):
+    with open(result_file, 'w') as f:
         print(data, file=f)
 
 async def execute():
-    # Get the IPC FD early so we can report errors through it
-    ipc_fd_str = os.environ.get('REMOTE_EXECUTION_IPC_FD')
-    if not ipc_fd_str:
-        print("Error: REMOTE_EXECUTION_IPC_FD environment variable not set", file=sys.stderr)
+    result_file = os.environ.get('REMOTE_EXECUTION_RESULT_FILE')
+    if not result_file:
+        print("Error: REMOTE_EXECUTION_RESULT_FILE environment variable not set", file=sys.stderr)
         sys.exit(1)
 
     try:
-        ipc_fd = int(ipc_fd_str)
-    except ValueError as e:
-        print(f"Error: Invalid IPC FD value '{{ipc_fd_str}}': {{e}}", file=sys.stderr)
-        sys.exit(1)
-
-    try:
+        {import_model}
+        {import_func}
         res = await {func_name}({arg})
-        _write_to_ipc(ipc_fd, res.model_dump_json())
+        _write_result(result_file, res.model_dump_json())
     except Exception as e:
-        # Always write to IPC FD so the shell doesn't hang
         error_response = json.dumps({{
             "__remote_execution_error__": True,
             "error_type": type(e).__name__,
             "error_message": str(e),
-            # "traceback": traceback.format_exc()
         }})
-        _write_to_ipc(ipc_fd, error_response)
+        _write_result(result_file, error_response)
         print(f"Remote execution failed: {{e}}", file=sys.stderr)
         sys.exit(1)
 
@@ -76,6 +63,7 @@ if __name__ == "__main__":
 _BACKEND_REGISTRY: dict[BackendType, type[Backend]] = {
     BackendType.SUBPROCESS: SubprocessBackend,
     BackendType.E2B: E2BBackend,
+    BackendType.DAYTONA: DaytonaBackend,
 }
 
 # Cache to track which backend configurations have been pre-checked
@@ -150,7 +138,7 @@ def remote[I: BaseModel, O: BaseModel](
             )
 
             # Wrap the Python code in the execution harness bash script
-            bash_script = _HARNESS_TEMPLATE.format(shell=backend_shell, code=python_code)
+            bash_script = _HARNESS_TEMPLATE.format(shell=backend_shell, python_cmd=backend_impl.PYTHON_CMD, code=python_code)
 
             # Execute using the configured backend with timeout
             stdout_str = await backend_impl.execute(

@@ -19,6 +19,7 @@ classifiers = [
     "Topic :: System :: Distributed Computing",
 ]
 dependencies = [
+    "daytona>=0.146.0",
     "e2b-code-interpreter>=2.4.1",
     "pydantic>=2.12.5",
     "python-dotenv>=1.2.1",

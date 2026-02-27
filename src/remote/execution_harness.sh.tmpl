@@ -1,35 +1,17 @@
 #!/usr/bin/env {shell}
-# Cross-platform harness: requires bash 4+ or zsh for dynamic FD assignment support
-# (macOS default bash 3.2 doesn't support dynamic FDs, hence the configurable shell)
+# Execution harness: runs Python code in isolation and captures the result.
+# Python communicates its response via a temp file to avoid any accidental
+# collisions with logs the user code may emit to stdout.
 
-# This script exists to ensure that the arbitrary python code we end up
-# executing remotely can communicate its response on a unique FD to avoid any
-# accidental collisions on stdout with logs the user code may have emitted.
-# This is a standard IPC problem where you need some solution to avoid the
-# communication between processes getting conflated with other stdout.
+# Create a unique temp file for IPC with PID to avoid conflicts
+RESULT_FILE="/tmp/remote_execution_result_$$"
+trap 'rm -f "$RESULT_FILE"' EXIT INT TERM
 
-# 1. Create a unique named pipe (FIFO) with PID to avoid conflicts
-PIPE_PATH="/tmp/remote_execution_ipc_pipe_$$"
-[ -p "$PIPE_PATH" ] || mkfifo "$PIPE_PATH"
-
-# Ensure cleanup happens even if the script fails or is interrupted
-trap 'rm -f "$PIPE_PATH"' EXIT INT TERM
-
-# 2. Open the pipe for reading/writing on a dynamic File Descriptor
-# This ensures the pipe doesn't "close" when Python finishes writing
-exec {{IPC_FD}}<>"$PIPE_PATH"
-
-# 3. Launch Python and pass the FD number as an env var
-# We redirect Python's stdout to /dev/null using '1>/dev/null'
-# This isolates the Python logic from this Bash script's output.
-# Set REMOTE_EXECUTION_MODE to prevent recursively triggering unlimited remote work.
-REMOTE_EXECUTION_MODE=1 REMOTE_EXECUTION_IPC_FD=$IPC_FD uv run python 1>/dev/null <<'EOF'
+# Run Python and pass the result file path as an env var
+# Redirect stdout and stderr to /dev/null to isolate from harness output
+REMOTE_EXECUTION_MODE=1 REMOTE_EXECUTION_RESULT_FILE="$RESULT_FILE" {python_cmd} >/dev/null 2>&1 <<'EOF'
 {code}
 EOF
 
-# 4. Read the result from the specific FD (-u flag) and print JUST that output to stdout.
-read -r -u "$IPC_FD" RESULT
-echo "$RESULT"
-
-# 5. Close the FD (cleanup handled by trap)
-exec {{IPC_FD}}>&-
+# Print the result to stdout (this is the only output from the harness)
+cat "$RESULT_FILE"
