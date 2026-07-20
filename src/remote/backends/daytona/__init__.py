@@ -16,7 +16,6 @@ def _snapshot_name(config: Daytona, local_project_root: Path) -> str:
     dockerfile = resolve_dockerfile(config.dockerfile_path, local_project_root)
     base = image_name(
         prefix=config.snapshot_name,
-        version=config.snapshot_version,
         dockerfile=dockerfile,
         local_project_root=local_project_root,
     )

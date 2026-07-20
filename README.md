@@ -158,12 +158,26 @@ can also set an auto-pause interval on the platform side as a safety net.
 ## Building images: local dev vs CI/CD
 
 E2B templates and Daytona snapshots are built from your `Dockerfile` and cached
-under the name `{prefix}-v{version}-{dockerfile_hash}` (version from
-`pyproject.toml` unless overridden); Daytona snapshots additionally append
-`-{sandbox_class}`, since the class is baked into the snapshot. Editing the
-Dockerfile automatically produces a new image name; **editing source files that
-the Dockerfile COPYs does not** — bump your project version after source changes
-so a fresh image is built.
+under the name `{prefix}-{context_hash}`; Daytona snapshots additionally append
+`-{sandbox_class}`, since the class is baked into the snapshot. The hash covers
+the **entire build context** — every file under `local_project_root` that your
+`.dockerignore` doesn't exclude, plus the Dockerfile itself — so editing
+*anything* the image could contain automatically produces a new image name and
+triggers a fresh build. There is no version to bump and no `pyproject.toml`
+requirement; staleness is simply impossible.
+
+Notes on the context hash:
+
+- `.dockerignore` is honored with Docker's semantics (root-anchored patterns,
+  `**` globs, `!` negations, last match wins). A tight `.dockerignore` is
+  doubly worthwhile: smaller build contexts *and* fewer spurious rebuilds from
+  files your image never contains.
+- VCS internals, caches, and virtualenvs (`.git`, `__pycache__`, `.venv`,
+  `node_modules`, etc.) are always excluded from the hash, even without a
+  `.dockerignore` — otherwise every commit or test run would look like a
+  source change.
+- Want a human-readable marker (a version, an environment) in image names on
+  your E2B/Daytona dashboard? Just put it in the prefix itself.
 
 Whether a missing image may be built lazily at runtime is controlled by the
 **`REMOTE_BOX_AUTO_BUILD` environment variable** (default: true), so switching
@@ -222,7 +236,7 @@ from remote import remote, E2B
 @remote(
     local_project_root=Path(__file__).parent,
     backend=E2B(
-        template_prefix="my-project",   # template name becomes "my-project-v{version}-{hash}"
+        template_prefix="my-project",   # template name becomes "my-project-{context_hash}"
         e2b_api_key="...",              # or set E2B_API_KEY env var
         cpu_count=2,
         memory_mb=2048,
@@ -241,7 +255,7 @@ from remote import remote, Daytona
 @remote(
     local_project_root=Path(__file__).parent,
     backend=Daytona(
-        snapshot_name="my-project",     # snapshot name becomes "my-project-v{version}-{hash}"
+        snapshot_name="my-project",     # snapshot name becomes "my-project-{context_hash}"
         daytona_api_key="...",          # or set DAYTONA_API_KEY env var
         cpu_count=2,
         memory_gb=2,
@@ -292,7 +306,7 @@ except RemoteExecutionError as e:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `local_project_root` | `Path` | required | Root directory used to resolve imports and locate `Dockerfile`/`pyproject.toml` |
+| `local_project_root` | `Path` | required | Root directory used to resolve imports, locate the `Dockerfile`, and define the build context that gets hashed |
 | `backend` | `AnyBackendConfig` | `Subprocess()` | Backend to execute on |
 | `timeout_millis` | `int` | `300000` | Max execution time in ms (default 5 minutes) |
 
@@ -313,9 +327,8 @@ classmethod `await RemoteSession.resume(ref, backend=..., local_project_root=...
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `template_prefix` | required | Prefix for E2B template name (`{prefix}-v{version}-{hash}`) |
+| `template_prefix` | required | Prefix for E2B template name (`{prefix}-{context_hash}`) |
 | `e2b_api_key` | `None` | API key (falls back to `E2B_API_KEY` env var) |
-| `template_version` | `None` | Override version; defaults to `pyproject.toml` version |
 | `dockerfile_path` | `None` | Path to Dockerfile; defaults to `Dockerfile` in project root |
 | `cpu_count` | `1` | CPUs to allocate |
 | `memory_mb` | `1024` | Memory in MB to allocate |
@@ -326,9 +339,8 @@ classmethod `await RemoteSession.resume(ref, backend=..., local_project_root=...
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `snapshot_name` | required | Prefix for Daytona snapshot name (`{name}-v{version}-{hash}-{sandbox_class}`) |
+| `snapshot_name` | required | Prefix for Daytona snapshot name (`{name}-{context_hash}-{sandbox_class}`) |
 | `daytona_api_key` | `None` | API key (falls back to `DAYTONA_API_KEY` env var) |
-| `snapshot_version` | `None` | Override version; defaults to `pyproject.toml` version |
 | `dockerfile_path` | `None` | Path to Dockerfile; defaults to `Dockerfile` in project root |
 | `sandbox_class` | `"container"` | Daytona sandbox class. `"linux-vm"` enables true pause (processes survive); `"container"` pauses by stopping (disk only) |
 | `region_id` | `None` | Daytona region for the snapshot and sandboxes; defaults to the org's default region. Class availability varies by region |

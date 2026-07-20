@@ -1,0 +1,22 @@
+# Runs the examples with API keys loaded from the repo-root .env.local
+# (create it once with: cp .env.example .env.local — see that file for the keys).
+# `--project ..` pins uv to the repo's environment no matter where just runs.
+
+set dotenv-load := true
+set dotenv-filename := ".env.local"
+
+# List available recipes
+default:
+    @just --list
+
+# Local subprocess example — no API keys needed
+subprocess:
+    uv run --project .. subprocess_hello.py
+
+# One-shot cloud sandbox example (backend: daytona | e2b)
+hello backend="daytona":
+    uv run --project .. remote_hello.py --backend {{backend}}
+
+# Session example with pause/resume (backend: daytona | e2b)
+session backend="daytona":
+    uv run --project .. remote_session.py --backend {{backend}}

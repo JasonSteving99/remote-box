@@ -1,0 +1,6 @@
+# The duckdb/ subdir is its own standalone example project with its own image —
+# excluding it here keeps it out of THIS project root's build context (and hash),
+# so changes there never rebuild the remote_* examples' image.
+duckdb/
+__pycache__/
+justfile

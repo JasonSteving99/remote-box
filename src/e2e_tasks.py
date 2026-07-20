@@ -13,10 +13,7 @@ from pydantic import BaseModel
 from remote import remote, Daytona
 
 PROJECT_ROOT = Path(__file__).parent.parent
-BACKEND = Daytona(
-    snapshot_name="my-project",
-    snapshot_version="0_3_2",
-)
+BACKEND = Daytona(snapshot_name="my-project")
 
 
 class WriteRequest(BaseModel):

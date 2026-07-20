@@ -15,7 +15,6 @@ def _template_alias(config: E2B, local_project_root: Path) -> str:
     dockerfile = resolve_dockerfile(config.dockerfile_path, local_project_root)
     return image_name(
         prefix=config.template_prefix,
-        version=config.template_version,
         dockerfile=dockerfile,
         local_project_root=local_project_root,
     )

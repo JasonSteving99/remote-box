@@ -54,11 +54,7 @@ class E2B(BackendConfig[Literal[BackendType.E2B]]):
     )
     template_prefix: str = Field(
         ...,
-        description="Prefix for E2B template naming. Full template alias will be '{prefix}-v{version}-{dockerfile_hash}'.",
-    )
-    template_version: Optional[str] = Field(
-        default=None,
-        description="Version to use for template naming. If not provided, reads project's pyproject.toml version.",
+        description="Prefix for E2B template naming. Full template alias will be '{prefix}-{context_hash}'.",
     )
     dockerfile_path: Optional[str] = Field(
         default=None,
@@ -102,11 +98,7 @@ class Daytona(BackendConfig[Literal[BackendType.DAYTONA]]):
     )
     snapshot_name: str = Field(
         ...,
-        description="Prefix for Daytona snapshot naming. Full snapshot name will be '{snapshot_name}-v{version}-{dockerfile_hash}'.",
-    )
-    snapshot_version: Optional[str] = Field(
-        default=None,
-        description="Version to use for snapshot naming. If not provided, reads project's pyproject.toml version.",
+        description="Prefix for Daytona snapshot naming. Full snapshot name will be '{snapshot_name}-{context_hash}-{sandbox_class}'.",
     )
     dockerfile_path: Optional[str] = Field(
         default=None,
@@ -304,7 +296,7 @@ class Backend(Protocol):
 
         Returns None for backends with no image (e.g. local subprocess). Used for
         human-readable reporting; may raise if the name can't be resolved (missing
-        Dockerfile/pyproject.toml).
+        Dockerfile).
         """
         ...
 

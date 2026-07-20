@@ -468,7 +468,6 @@ def test_daytona_snapshot_name_includes_sandbox_class(tmp_path):
     from remote.backends.daytona import _snapshot_name
 
     (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
-    (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\nversion = "1.2.3"\n')
 
     container = _snapshot_name(Daytona(snapshot_name="proj"), tmp_path)
     vm = _snapshot_name(Daytona(snapshot_name="proj", sandbox_class="linux-vm"), tmp_path)
@@ -526,7 +525,6 @@ def test_daytona_no_runners_error_is_wrapped_actionably(tmp_path, monkeypatch):
     from remote.backends.daytona import DaytonaBackend
 
     (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
-    (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\nversion = "1.2.3"\n')
 
     class StubSnapshots:
         def get(self, name):
@@ -548,3 +546,141 @@ def test_daytona_no_runners_error_is_wrapped_actionably(tmp_path, monkeypatch):
     config = Daytona(snapshot_name="proj", sandbox_class="linux-vm", region_id="us")
     with pytest.raises(ValueError, match="no 'linux-vm' runners in region 'us'"):
         DaytonaBackend.ensure_built(config, tmp_path, allow_build=True)
+
+
+# --- Image naming: build-context hashing ---------------------------------------
+
+
+def _fresh_image_name(root: Path) -> str:
+    """Compute image_name with the process-lifetime hash cache cleared, so tests
+    can mutate files and observe the name change."""
+    from remote.backends._common import _context_hash, image_name, resolve_dockerfile
+
+    _context_hash.cache_clear()
+    return image_name(
+        prefix="proj",
+        dockerfile=resolve_dockerfile(None, root),
+        local_project_root=root,
+    )
+
+
+def test_image_name_needs_no_pyproject(tmp_path):
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
+    assert _fresh_image_name(tmp_path).startswith("proj-")
+
+
+def test_image_name_changes_when_source_changes(tmp_path):
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\nCOPY . /app\n")
+    (tmp_path / "main.py").write_text("print('v1')\n")
+    before = _fresh_image_name(tmp_path)
+
+    (tmp_path / "main.py").write_text("print('v2')\n")
+    assert _fresh_image_name(tmp_path) != before
+
+    # Renames change the context even when contents don't.
+    (tmp_path / "main.py").rename(tmp_path / "app.py")
+    renamed = _fresh_image_name(tmp_path)
+    assert renamed != before
+
+
+def test_image_name_changes_when_dockerfile_changes(tmp_path):
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
+    before = _fresh_image_name(tmp_path)
+    (tmp_path / "Dockerfile").write_text("FROM python:3.13-slim\n")
+    assert _fresh_image_name(tmp_path) != before
+
+
+def test_image_name_honors_dockerignore(tmp_path):
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\nCOPY . /app\n")
+    (tmp_path / ".dockerignore").write_text("*.log\nscratch\n")
+    (tmp_path / "main.py").write_text("print('hi')\n")
+    before = _fresh_image_name(tmp_path)
+
+    # Ignored files don't affect the name...
+    (tmp_path / "debug.log").write_text("noise\n")
+    (tmp_path / "scratch").mkdir()
+    (tmp_path / "scratch" / "notes.txt").write_text("more noise\n")
+    assert _fresh_image_name(tmp_path) == before
+
+    # ...but editing .dockerignore itself does (it changes the effective context).
+    (tmp_path / ".dockerignore").write_text("*.log\n")
+    assert _fresh_image_name(tmp_path) != before
+
+
+def test_dockerignore_negation_reincludes(tmp_path):
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\nCOPY . /app\n")
+    (tmp_path / ".dockerignore").write_text("data\n!data/keep.txt\n")
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "keep.txt").write_text("v1\n")
+    (tmp_path / "data" / "drop.txt").write_text("v1\n")
+    before = _fresh_image_name(tmp_path)
+
+    # The re-included file participates in the hash; its sibling doesn't.
+    (tmp_path / "data" / "drop.txt").write_text("v2\n")
+    assert _fresh_image_name(tmp_path) == before
+    (tmp_path / "data" / "keep.txt").write_text("v2\n")
+    assert _fresh_image_name(tmp_path) != before
+
+
+def test_dockerignore_root_anchored_like_docker_not_gitignore(tmp_path):
+    """In .dockerignore, `*.md` matches only at the context root — unlike
+    gitignore, it does not match nested files. `**/*.md` does."""
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\nCOPY . /app\n")
+    (tmp_path / ".dockerignore").write_text("*.md\n")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "guide.md").write_text("v1\n")
+    before = _fresh_image_name(tmp_path)
+
+    (tmp_path / "docs" / "guide.md").write_text("v2\n")
+    assert _fresh_image_name(tmp_path) != before  # nested .md is NOT ignored
+
+    (tmp_path / "README.md").write_text("root-level\n")
+    with_root_md = _fresh_image_name(tmp_path)
+    (tmp_path / "README.md").write_text("root-level edited\n")
+    assert _fresh_image_name(tmp_path) == with_root_md  # root .md IS ignored
+
+    (tmp_path / ".dockerignore").write_text("**/*.md\n")
+    deep_ignored = _fresh_image_name(tmp_path)
+    (tmp_path / "docs" / "guide.md").write_text("v3\n")
+    assert _fresh_image_name(tmp_path) == deep_ignored
+
+
+def test_context_hash_skips_vcs_and_cache_dirs(tmp_path):
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\nCOPY . /app\n")
+    (tmp_path / "main.py").write_text("print('hi')\n")
+    before = _fresh_image_name(tmp_path)
+
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "index").write_bytes(b"\x00\x01")
+    (tmp_path / "__pycache__").mkdir()
+    (tmp_path / "__pycache__" / "main.cpython-312.pyc").write_bytes(b"\x00")
+    (tmp_path / ".venv").mkdir()
+    (tmp_path / ".venv" / "pyvenv.cfg").write_text("home = /usr\n")
+    assert _fresh_image_name(tmp_path) == before
+
+
+def test_build_cli_resolves_sibling_imports_in_crawled_dirs(
+    tmp_path, monkeypatch, isolated_registry
+):
+    """A task file importing a sibling module (`from helper import X`) must
+    import during discovery, matching how it resolves when run directly and
+    inside the sandbox (project root as cwd)."""
+    from remote.cli import main
+
+    tasks = tmp_path / "crawl_pkg"
+    tasks.mkdir()
+    (tasks / "crawl_helper.py").write_text("GREETING = 'hi'\n")
+    (tasks / "crawl_task.py").write_text(
+        "from pathlib import Path\n"
+        "from pydantic import BaseModel\n"
+        "from crawl_helper import GREETING\n"
+        "from remote import remote, Subprocess\n"
+        "class In_(BaseModel):\n    x: int\n"
+        "class Out(BaseModel):\n    y: str\n"
+        "@remote(local_project_root=Path(__file__).parent, backend=Subprocess())\n"
+        "async def task(arg: In_) -> Out:\n    return Out(y=GREETING)\n"
+    )
+
+    # Under cwd, so the dotted-package import path (`crawl_pkg.crawl_task`) is taken.
+    monkeypatch.chdir(tmp_path)
+    assert main(["build", "crawl_pkg", "--check"]) == 0

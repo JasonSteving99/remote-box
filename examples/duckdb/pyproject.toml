@@ -1,0 +1,10 @@
+[project]
+name = "duckdb-example"
+# remote-box ignores this version entirely — image names come from hashing the
+# build context. The pyproject exists purely to declare the sandbox's deps.
+version = "0.0.0"
+requires-python = ">=3.12"
+dependencies = [
+    "remote-box",
+    "duckdb",
+]

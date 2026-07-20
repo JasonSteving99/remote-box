@@ -1,0 +1,15 @@
+# Runs the DuckDB example with API keys loaded from the repo-root .env.local
+# (create it once with: cp .env.example .env.local — see that file for the keys).
+# `--project ../..` pins uv to the repo's environment, which deliberately does
+# NOT have duckdb installed — that dependency exists only in the sandbox image.
+
+set dotenv-load := true
+set dotenv-filename := ".env.local"
+
+# List available recipes
+default:
+    @just --list
+
+# Run the DuckDB session example (backend: daytona | e2b)
+run backend="daytona":
+    uv run --project ../.. main.py --backend {{backend}}

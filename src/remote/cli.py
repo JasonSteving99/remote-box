@@ -65,6 +65,13 @@ def _dotted_module_name(path: Path) -> str | None:
 
 def _import_file(path: Path) -> None:
     """Import a single .py file, preferring its package path when it has one."""
+    # A script's own directory is on sys.path when run directly, and sandboxes
+    # import task modules with the project root as cwd — mirror that here so
+    # sibling imports (`from helper import X`) resolve during discovery too.
+    parent = str(path.parent.resolve())
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
+
     dotted = _dotted_module_name(path)
     if dotted is not None:
         importlib.import_module(dotted)
@@ -73,7 +80,6 @@ def _import_file(path: Path) -> None:
     # Standalone fallback for files outside the cwd package tree. Unique module
     # name derived from the full path so same-named files can't collide.
     module_name = re.sub(r"\W", "_", str(path.resolve().with_suffix("")))
-    sys.path.insert(0, str(path.parent))
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Could not load module from {path}")
