@@ -132,13 +132,24 @@ async with session:
     result = await next_tool(input)
 ```
 
-Pause/resume semantics per backend:
+Pause/resume semantics per backend — declared upfront by the config, queryable
+via `session.pause_semantics` (a `PauseSemantics` enum) before the session even
+starts:
 
-| Backend | `pause()` | Preserved | Cross-process resume |
-|---------|-----------|-----------|----------------------|
-| Daytona | native pause; falls back to stop if the sandbox class doesn't support pausing | filesystem and memory (filesystem only on the stop fallback) | `client.get(id)` + start |
-| E2B | native sandbox pause | filesystem **and** memory | `AsyncSandbox.connect(id)` |
-| Subprocess | no-op (nothing to pause) | local filesystem trivially | fresh handle |
+| Backend | `pause_semantics` | `pause()` does | Preserved | Cross-process resume |
+|---------|-------------------|----------------|-----------|----------------------|
+| Daytona (`sandbox_class="linux-vm"`) | `SUSPEND` | native pause | filesystem **and** memory — running processes survive | `client.get(id)` + start |
+| Daytona (`sandbox_class="container"`, default) | `STOP` | stop | filesystem only — **processes are killed** | `client.get(id)` + start |
+| E2B | `SUSPEND` | native sandbox pause | filesystem **and** memory | `AsyncSandbox.connect(id)` |
+| Subprocess | `NOOP` | nothing | local filesystem trivially | fresh handle |
+
+If your agents leave background processes running across a pause (a dev server,
+a long build), use Daytona's `sandbox_class="linux-vm"` (or E2B). The class is
+baked into the snapshot at build time and included in its name, so switching
+class builds a new snapshot. Not every Daytona region/organization has
+`linux-vm` runners — if yours doesn't, the snapshot build fails upfront with an
+actionable error (set `region_id` to a region that offers it, or ask Daytona to
+enable it for your organization).
 
 Prefer pausing at genuine idle points rather than after every call — a
 pause/resume round trip costs a few seconds on the cloud backends. Daytona users
@@ -148,9 +159,11 @@ can also set an auto-pause interval on the platform side as a safety net.
 
 E2B templates and Daytona snapshots are built from your `Dockerfile` and cached
 under the name `{prefix}-v{version}-{dockerfile_hash}` (version from
-`pyproject.toml` unless overridden). Editing the Dockerfile automatically produces
-a new image name; **editing source files that the Dockerfile COPYs does not** —
-bump your project version after source changes so a fresh image is built.
+`pyproject.toml` unless overridden); Daytona snapshots additionally append
+`-{sandbox_class}`, since the class is baked into the snapshot. Editing the
+Dockerfile automatically produces a new image name; **editing source files that
+the Dockerfile COPYs does not** — bump your project version after source changes
+so a fresh image is built.
 
 Whether a missing image may be built lazily at runtime is controlled by the
 **`REMOTE_BOX_AUTO_BUILD` environment variable** (default: true), so switching
@@ -313,13 +326,15 @@ classmethod `await RemoteSession.resume(ref, backend=..., local_project_root=...
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `snapshot_name` | required | Prefix for Daytona snapshot name (`{name}-v{version}-{hash}`) |
+| `snapshot_name` | required | Prefix for Daytona snapshot name (`{name}-v{version}-{hash}-{sandbox_class}`) |
 | `daytona_api_key` | `None` | API key (falls back to `DAYTONA_API_KEY` env var) |
 | `snapshot_version` | `None` | Override version; defaults to `pyproject.toml` version |
 | `dockerfile_path` | `None` | Path to Dockerfile; defaults to `Dockerfile` in project root |
+| `sandbox_class` | `"container"` | Daytona sandbox class. `"linux-vm"` enables true pause (processes survive); `"container"` pauses by stopping (disk only) |
+| `region_id` | `None` | Daytona region for the snapshot and sandboxes; defaults to the org's default region. Class availability varies by region |
 | `cpu_count` | `1` | CPUs to allocate |
-| `memory_gb` | `1` | Memory in GB to allocate |
-| `disk_gb` | `3` | Disk in GB to allocate |
+| `memory_gb` | `1` | Memory in GB to allocate (per-class minimums validated at config time) |
+| `disk_gb` | `3` | Disk in GB to allocate (`linux-vm` requires ≥ 3) |
 | `auto_build_override` | `None` | Pin auto-build for this config, overriding `REMOTE_BOX_AUTO_BUILD`; prefer leaving unset |
 | `create_timeout_seconds` | `120` | Max time to wait for sandbox creation |
 

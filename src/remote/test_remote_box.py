@@ -445,3 +445,106 @@ def test_cli_check_reports_missing_image(tmp_path, isolated_registry, monkeypatc
     assert "my-project-v9-deadbeef" in out
     # --check must never actually build
     assert StubDaytonaBackend.built is False
+
+
+def test_daytona_config_validates_resource_minimums_per_class():
+    from pydantic import ValidationError
+
+    from remote import Daytona
+
+    # linux-vm requires at least 3 GB disk (Daytona's smallest VM shape).
+    with pytest.raises(ValidationError, match="disk_gb >= 3"):
+        Daytona(snapshot_name="x", sandbox_class="linux-vm", disk_gb=2)
+    # The defaults satisfy every class.
+    assert Daytona(snapshot_name="x", sandbox_class="linux-vm").disk_gb == 3
+    assert Daytona(snapshot_name="x").sandbox_class == "container"
+    # Only classes that make sense for a Linux Dockerfile are accepted.
+    with pytest.raises(ValidationError):
+        Daytona(snapshot_name="x", sandbox_class="windows")
+
+
+def test_daytona_snapshot_name_includes_sandbox_class(tmp_path):
+    from remote import Daytona
+    from remote.backends.daytona import _snapshot_name
+
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\nversion = "1.2.3"\n')
+
+    container = _snapshot_name(Daytona(snapshot_name="proj"), tmp_path)
+    vm = _snapshot_name(Daytona(snapshot_name="proj", sandbox_class="linux-vm"), tmp_path)
+    assert container.endswith("-container")
+    assert vm.endswith("-linux-vm")
+    assert container.removesuffix("-container") == vm.removesuffix("-linux-vm")
+
+
+def test_pause_semantics_declared_per_backend():
+    from remote import Daytona, PauseSemantics, RemoteSession, Subprocess
+    from remote.backends.daytona import DaytonaBackend
+    from remote.backends.e2b import E2BBackend
+    from remote.backends.subprocess import SubprocessBackend
+
+    assert SubprocessBackend.pause_semantics(Subprocess()) is PauseSemantics.NOOP
+    assert E2BBackend.pause_semantics(None) is PauseSemantics.SUSPEND
+    assert (
+        DaytonaBackend.pause_semantics(Daytona(snapshot_name="x")) is PauseSemantics.STOP
+    )
+    assert (
+        DaytonaBackend.pause_semantics(Daytona(snapshot_name="x", sandbox_class="linux-vm"))
+        is PauseSemantics.SUSPEND
+    )
+    # Exposed on the session without starting it.
+    session = RemoteSession(backend=Subprocess(), local_project_root=PROJECT_ROOT)
+    assert session.pause_semantics is PauseSemantics.NOOP
+
+
+def test_daytona_pause_is_deterministic_not_fallback():
+    """pause() picks pause vs stop from the config-declared class — it never
+    calls the API speculatively and sniffs 'not supported' errors."""
+    from unittest.mock import AsyncMock
+
+    from remote.backends.daytona import DaytonaBackend, DaytonaHandle
+
+    sandbox = AsyncMock()
+    handle = DaytonaHandle(client=AsyncMock(), sandbox=sandbox, suspend_capable=True)
+    asyncio.run(DaytonaBackend.pause(handle))
+    sandbox.pause.assert_awaited_once()
+    sandbox.stop.assert_not_awaited()
+
+    sandbox = AsyncMock()
+    handle = DaytonaHandle(client=AsyncMock(), sandbox=sandbox, suspend_capable=False)
+    asyncio.run(DaytonaBackend.pause(handle))
+    sandbox.stop.assert_awaited_once()
+    sandbox.pause.assert_not_awaited()
+
+
+def test_daytona_no_runners_error_is_wrapped_actionably(tmp_path, monkeypatch):
+    """When Daytona has no runners for the requested class, ensure_built fails
+    fast — before any build — with guidance on region_id / org enablement."""
+    import daytona as daytona_sdk
+
+    from remote import Daytona
+    from remote.backends.daytona import DaytonaBackend
+
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\n")
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\nversion = "1.2.3"\n')
+
+    class StubSnapshots:
+        def get(self, name):
+            raise daytona_sdk.DaytonaNotFoundError("not found")
+
+        def create(self, params, on_logs=None):
+            assert params.sandbox_class == daytona_sdk.SandboxClass.LINUX_VM
+            raise daytona_sdk.DaytonaError(
+                "Failed to create snapshot: No runners are configured in region 'us' "
+                "for sandbox class 'linux-vm'. Try a different region or sandbox class."
+            )
+
+    class StubClient:
+        snapshot = StubSnapshots()
+
+    monkeypatch.setattr(daytona_sdk, "Daytona", lambda *a, **kw: StubClient())
+    monkeypatch.setenv("DAYTONA_API_KEY", "test-key")
+
+    config = Daytona(snapshot_name="proj", sandbox_class="linux-vm", region_id="us")
+    with pytest.raises(ValueError, match="no 'linux-vm' runners in region 'us'"):
+        DaytonaBackend.ensure_built(config, tmp_path, allow_build=True)

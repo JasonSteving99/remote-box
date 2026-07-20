@@ -3,7 +3,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from remote.backends import AnyBackendConfig, Subprocess
+from remote.backends import AnyBackendConfig, PauseSemantics, Subprocess
 
 
 @dataclass
@@ -112,6 +112,10 @@ class SubprocessBackend:
     def sandbox_id(handle: SubprocessHandle) -> str | None:
         """No persistent sandbox, so nothing to reference."""
         return None
+
+    @staticmethod
+    def pause_semantics(config: AnyBackendConfig) -> PauseSemantics:
+        return PauseSemantics.NOOP
 
     @staticmethod
     async def pause(handle: SubprocessHandle) -> None:

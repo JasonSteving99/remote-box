@@ -128,3 +128,4 @@ def test_pause_then_resume_from_ref_preserves_state():
             await session.close()
 
     assert asyncio.run(scenario()) == "wrote before pausing"
+

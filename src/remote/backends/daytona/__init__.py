@@ -6,7 +6,7 @@ from pathlib import Path
 
 import daytona as daytona_sdk
 
-from remote.backends import AnyBackendConfig, Daytona, MissingImageError
+from remote.backends import AnyBackendConfig, Daytona, MissingImageError, PauseSemantics
 from remote.backends._common import image_name, require_api_key, resolve_dockerfile
 
 logger = getLogger(__name__)
@@ -14,12 +14,16 @@ logger = getLogger(__name__)
 
 def _snapshot_name(config: Daytona, local_project_root: Path) -> str:
     dockerfile = resolve_dockerfile(config.dockerfile_path, local_project_root)
-    return image_name(
+    base = image_name(
         prefix=config.snapshot_name,
         version=config.snapshot_version,
         dockerfile=dockerfile,
         local_project_root=local_project_root,
     )
+    # The sandbox class is baked into the snapshot (sandboxes inherit it), so it
+    # must be part of the identity: the same Dockerfile as 'container' and as
+    # 'linux-vm' are different snapshots.
+    return f"{base}-{config.sandbox_class}"
 
 
 def _api_key(config: Daytona) -> str:
@@ -32,6 +36,13 @@ class DaytonaHandle:
 
     client: daytona_sdk.AsyncDaytona
     sandbox: daytona_sdk.AsyncSandbox
+    # From the config's sandbox_class: True means the sandbox supports true
+    # pause (memory + processes frozen); False means only stop (disk-only).
+    suspend_capable: bool
+
+
+def _suspend_capable(config: Daytona) -> bool:
+    return config.sandbox_class == "linux-vm"
 
 
 class DaytonaBackend:
@@ -87,10 +98,12 @@ class DaytonaBackend:
                         memory=config.memory_gb,
                         disk=config.disk_gb,
                     ),
+                    sandbox_class=daytona_sdk.SandboxClass(config.sandbox_class),
+                    region_id=config.region_id,
                 ),
                 on_logs=lambda msg: logger.info(f"[Daytona snapshot build] {msg}"),
             )
-        except Exception:
+        except Exception as e:
             # Another process may have built the same snapshot concurrently; if it
             # exists now, the goal is met and the failure is benign.
             try:
@@ -101,6 +114,20 @@ class DaytonaBackend:
                 return False
             except daytona_sdk.DaytonaNotFoundError:
                 pass
+            # Daytona rejects the class/region combination before building, so
+            # unsupported configs fail here — at build time — not at pause time.
+            if isinstance(e, daytona_sdk.DaytonaError) and "no runners" in str(e).lower():
+                region = (
+                    f"region '{config.region_id}'"
+                    if config.region_id
+                    else "your organization's default region"
+                )
+                raise ValueError(
+                    f"Daytona has no '{config.sandbox_class}' runners in {region}. "
+                    f"Sandbox class availability varies by region and organization: set "
+                    f"region_id to a region that offers '{config.sandbox_class}', or ask "
+                    f"Daytona to enable it for your organization. Original error: {e}"
+                ) from e
             raise
 
         logger.info(f"Daytona snapshot '{full_snapshot_name}' successfully built.")
@@ -123,14 +150,17 @@ class DaytonaBackend:
         try:
             sandbox = await client.create(
                 daytona_sdk.CreateSandboxFromSnapshotParams(
-                    snapshot=_snapshot_name(config, local_project_root)
+                    snapshot=_snapshot_name(config, local_project_root),
+                    # Snapshots are region-scoped; keep the sandbox in the same
+                    # region rather than the organization default.
+                    target=config.region_id,
                 ),
                 timeout=config.create_timeout_seconds,
             )
         except BaseException:
             await client.close()
             raise
-        return DaytonaHandle(client=client, sandbox=sandbox)
+        return DaytonaHandle(client=client, sandbox=sandbox, suspend_capable=_suspend_capable(config))
 
     @staticmethod
     async def run(handle: DaytonaHandle, bash_script: str, timeout_millis: int) -> str:
@@ -155,16 +185,20 @@ class DaytonaBackend:
         return handle.sandbox.id
 
     @staticmethod
+    def pause_semantics(config: AnyBackendConfig) -> PauseSemantics:
+        if not isinstance(config, Daytona):
+            raise TypeError(f"DaytonaBackend requires Daytona config, got {type(config)}")
+        return PauseSemantics.SUSPEND if _suspend_capable(config) else PauseSemantics.STOP
+
+    @staticmethod
     async def pause(handle: DaytonaHandle) -> None:
-        # Daytona pause retains memory state as well as disk, but not every
-        # sandbox class supports it. Fall back to stop() — disk-only
-        # persistence — which start() resumes all the same.
-        try:
+        # Only VM sandbox classes support true pause (memory + processes frozen);
+        # container sandboxes can only stop (disk persists, processes killed).
+        # The choice is declared by the config's sandbox_class — see
+        # pause_semantics — so which one runs here is never a surprise.
+        if handle.suspend_capable:
             await handle.sandbox.pause()
-        except daytona_sdk.DaytonaError as e:
-            if "not supported" not in str(e).lower():
-                raise
-            logger.info(f"Sandbox pause unsupported, falling back to stop(): {e}")
+        else:
             await handle.sandbox.stop()
 
     @staticmethod
@@ -191,7 +225,7 @@ class DaytonaBackend:
         except BaseException:
             await client.close()
             raise
-        return DaytonaHandle(client=client, sandbox=sandbox)
+        return DaytonaHandle(client=client, sandbox=sandbox, suspend_capable=_suspend_capable(config))
 
     @staticmethod
     async def release(handle: DaytonaHandle) -> None:

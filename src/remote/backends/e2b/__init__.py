@@ -5,7 +5,7 @@ from pathlib import Path
 from e2b import AsyncSandbox, CommandExitException, Template, default_build_logger, wait_for_timeout
 from e2b.exceptions import TimeoutException
 
-from remote.backends import E2B, AnyBackendConfig, MissingImageError
+from remote.backends import E2B, AnyBackendConfig, MissingImageError, PauseSemantics
 from remote.backends._common import image_name, require_api_key, resolve_dockerfile
 
 logger = getLogger(__name__)
@@ -143,6 +143,10 @@ class E2BBackend:
     @staticmethod
     def sandbox_id(handle: E2BHandle) -> str | None:
         return handle.sandbox.sandbox_id
+
+    @staticmethod
+    def pause_semantics(config: AnyBackendConfig) -> PauseSemantics:
+        return PauseSemantics.SUSPEND
 
     @staticmethod
     async def pause(handle: E2BHandle) -> None:

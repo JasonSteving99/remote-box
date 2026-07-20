@@ -1,7 +1,7 @@
 from enum import Enum, auto
 from pathlib import Path
-from pydantic import BaseModel, Field, SecretStr
-from typing import Any, Literal, Optional, Protocol
+from pydantic import BaseModel, Field, SecretStr, model_validator
+from typing import Any, Literal, Optional, Protocol, Self
 
 
 class BackendType(Enum):
@@ -11,6 +11,25 @@ class BackendType(Enum):
     E2B = auto()
     DAYTONA = auto()
     # Future: UBUNTU = "ubuntu", SSH = "ssh", etc.
+
+
+class PauseSemantics(Enum):
+    """What `RemoteSession.pause()` actually preserves, determined by the backend config.
+
+    Query it via `session.pause_semantics` (or `Backend.pause_semantics(config)`)
+    to know upfront — before any sandbox exists — whether running processes
+    survive a pause, instead of finding out when a background process is gone
+    after resume.
+    """
+
+    SUSPEND = auto()
+    """True pause: memory and running processes are frozen and survive resume."""
+
+    STOP = auto()
+    """Disk-only: the filesystem persists but all processes are killed on pause."""
+
+    NOOP = auto()
+    """Nothing to pause — no persistent sandbox (local subprocess backend)."""
 
 
 class BackendConfig[T: BackendType](BaseModel):
@@ -93,6 +112,27 @@ class Daytona(BackendConfig[Literal[BackendType.DAYTONA]]):
         default=None,
         description="Path to Dockerfile for Daytona backend. If not provided will look for `Dockerfile` in local project root.",
     )
+    sandbox_class: Literal["container", "linux-vm"] = Field(
+        default="container",
+        description=(
+            "Daytona sandbox class, baked into the snapshot at build time. 'container' "
+            "(default, cheapest) does NOT support pause: RemoteSession.pause() stops the "
+            "sandbox — the filesystem persists but all processes are killed. 'linux-vm' "
+            "supports true pause: memory and running processes are frozen and survive "
+            "resume (required if agents leave background processes running across a "
+            "pause). Not every Daytona region has runners for every class; if yours "
+            "doesn't, snapshot creation fails upfront with the available options."
+        ),
+    )
+    region_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Daytona region to build the snapshot in and run sandboxes on (e.g. 'us', "
+            "'eu'). If not set, the organization's default region is used. Sandbox class "
+            "availability varies by region, so pinning a class may require pinning the "
+            "region that has runners for it."
+        ),
+    )
     cpu_count: int = Field(
         default=1,
         description="Number of CPUs to allocate for the Daytona sandbox.",
@@ -120,6 +160,25 @@ class Daytona(BackendConfig[Literal[BackendType.DAYTONA]]):
         default=120,
         description="Maximum time in seconds to wait for sandbox creation.",
     )
+
+    # Smallest shapes Daytona documents per class (its default snapshot tiers);
+    # the API rejects anything smaller server-side, so catch it at config time.
+    _RESOURCE_MINIMUMS = {
+        "container": {"cpu_count": 1, "memory_gb": 1, "disk_gb": 1},
+        "linux-vm": {"cpu_count": 1, "memory_gb": 1, "disk_gb": 3},
+    }
+
+    @model_validator(mode="after")
+    def _validate_resources_for_class(self) -> Self:
+        minimums = self._RESOURCE_MINIMUMS[self.sandbox_class]
+        for field, minimum in minimums.items():
+            value = getattr(self, field)
+            if value < minimum:
+                raise ValueError(
+                    f"Daytona sandbox class '{self.sandbox_class}' requires "
+                    f"{field} >= {minimum}, got {value}."
+                )
+        return self
 
 
 # Type alias for all backend configs (discriminated union)
@@ -295,13 +354,27 @@ class Backend(Protocol):
         ...
 
     @staticmethod
+    def pause_semantics(config: AnyBackendConfig) -> PauseSemantics:
+        """
+        What `pause` will actually preserve for this config.
+
+        Purely config-derived — callable before any sandbox exists — so callers
+        that depend on processes surviving a pause (e.g. an agent leaving a dev
+        server running) can verify support upfront rather than discovering the
+        degradation after resume.
+        """
+        ...
+
+    @staticmethod
     async def pause(handle: Any) -> None:
         """
         Pause the sandbox so it stops consuming compute while idle.
 
         The sandbox must be resumable afterwards — either in-place via `resume`
-        or from another process via `reconnect`. No-op for backends with no
-        persistent sandbox.
+        or from another process via `reconnect`. What survives the pause is
+        declared by `pause_semantics` for the handle's config: SUSPEND freezes
+        memory and processes, STOP persists only the filesystem, NOOP has no
+        sandbox to pause.
         """
         ...
 

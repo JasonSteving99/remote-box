@@ -5,7 +5,7 @@ from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Any, Self
 
-from remote.backends import AnyBackendConfig, SessionRef
+from remote.backends import AnyBackendConfig, PauseSemantics, SessionRef
 from remote.runtime import (
     BACKEND_REGISTRY,
     ensure_built_once,
@@ -103,6 +103,19 @@ class RemoteSession:
         return self._backend_impl.PYTHON_CMD
 
     @property
+    def pause_semantics(self) -> PauseSemantics:
+        """
+        What `pause()` will actually preserve, per the backend config.
+
+        SUSPEND: memory and running processes are frozen and survive resume.
+        STOP: the filesystem persists but processes are killed (e.g. Daytona's
+        default 'container' sandbox class — use sandbox_class='linux-vm' for
+        SUSPEND). NOOP: no persistent sandbox. Config-derived, so it can be
+        checked before starting the session.
+        """
+        return self._backend_impl.pause_semantics(self._backend)
+
+    @property
     def ref(self) -> SessionRef:
         """
         Serializable pointer to this session's sandbox.
@@ -143,6 +156,10 @@ class RemoteSession:
         `RemoteSession.resume(ref, ...)` reattaches from another process. Prefer
         calling this explicitly at genuine idle points (e.g. an agent waiting on
         human input) — pausing between back-to-back calls just adds latency.
+
+        Whether running processes survive the pause depends on the backend
+        config — check `session.pause_semantics`: only SUSPEND preserves them;
+        STOP keeps the filesystem but kills processes.
         """
         if self._handle is None:
             raise RuntimeError("RemoteSession is not started; nothing to pause.")

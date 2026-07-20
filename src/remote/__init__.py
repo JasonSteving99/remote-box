@@ -15,6 +15,7 @@ from remote.backends import (
     Daytona,
     AnyBackendConfig,
     MissingImageError,
+    PauseSemantics,
     RemoteExecutionError,
     RemoteExecutionErrorResponse,
     RemoteExecutionProtocolError,
@@ -28,6 +29,7 @@ __all__ = [
     # Sandbox sessions
     "RemoteSession",
     "SessionRef",
+    "PauseSemantics",
     "current_session",
     # Explicit image building (CI/CD)
     "build_all",
