@@ -1,91 +1,36 @@
-import os
-from pathlib import Path
-from remote.backends import E2B, AnyBackendConfig
-from e2b import Template, default_build_logger, wait_for_timeout, AsyncSandbox
-import tomllib
+from dataclasses import dataclass
 from logging import getLogger
-from functools import cache
+from pathlib import Path
+
+from e2b import AsyncSandbox, CommandExitException, Template, default_build_logger, wait_for_timeout
+from e2b.exceptions import TimeoutException
+
+from remote.backends import E2B, AnyBackendConfig, MissingImageError
+from remote.backends._common import image_name, require_api_key, resolve_dockerfile
 
 logger = getLogger(__name__)
 
 
-@cache
-def _get_api_key(*, e2b_api_key: str | None) -> str:
-    """
-    Get the E2B API key from config or environment.
-
-    This function is memoized to avoid repeated environment variable lookups.
-
-    Args:
-        e2b_api_key: API key from config (optional)
-
-    Returns:
-        E2B API key string
-
-    Raises:
-        ValueError: If API key cannot be found
-    """
-    api_key = e2b_api_key or os.environ.get("E2B_API_KEY")
-    if not api_key:
-        raise ValueError(
-            "E2B API key is required. Provide it in the config or set the E2B_API_KEY environment variable."
-        )
-    return api_key
+def _template_alias(config: E2B, local_project_root: Path) -> str:
+    dockerfile = resolve_dockerfile(config.dockerfile_path, local_project_root)
+    return image_name(
+        prefix=config.template_prefix,
+        version=config.template_version,
+        dockerfile=dockerfile,
+        local_project_root=local_project_root,
+    )
 
 
-@cache
-def _get_template_alias(
-    *,
-    template_prefix: str,
-    template_version: str | None,
-    local_project_root: Path,
-) -> str:
-    """
-    Get the E2B template alias for the given configuration.
+def _api_key(config: E2B) -> str:
+    return require_api_key(config.e2b_api_key, "E2B_API_KEY", "E2B")
 
-    Determines the template version from template_version if provided,
-    otherwise reads it from pyproject.toml. Returns the formatted template alias
-    string: {prefix}-v{version}
 
-    This function is memoized to avoid repeated file I/O when determining the
-    template alias across multiple decorator invocations with the same config.
+@dataclass
+class E2BHandle:
+    """Handle for a live E2B sandbox."""
 
-    Args:
-        template_prefix: Prefix for E2B template naming
-        template_version: Optional version string. If None, reads from pyproject.toml
-        local_project_root: Path to the local project root directory
-
-    Returns:
-        Template alias string in format: {prefix}-v{version}
-
-    Raises:
-        ValueError: If version cannot be determined
-    """
-    project_root_path = local_project_root.resolve()
-
-    # Determine version for template naming
-    if template_version:
-        version = template_version
-    else:
-        # Read project version from pyproject.toml
-        pyproject_path = project_root_path / "pyproject.toml"
-        if not pyproject_path.exists():
-            raise ValueError(
-                f"pyproject.toml not found in project root: {project_root_path}. "
-                "E2B backend requires project version."
-            )
-
-        with open(pyproject_path, "rb") as f:
-            pyproject_data = tomllib.load(f)
-
-        version = pyproject_data.get("project", {}).get("version")
-        if not version:
-            raise ValueError(
-                "Project version not found in pyproject.toml. E2B backend requires a version."
-            )
-
-    # Construct template alias: {prefix}-v{version}
-    return f"{template_prefix}-v{version}"
+    sandbox: AsyncSandbox
+    ttl_seconds: int
 
 
 class E2BBackend:
@@ -94,67 +39,38 @@ class E2BBackend:
     PYTHON_CMD: str = "/app/.venv/bin/python"
 
     @staticmethod
-    def pre_check(config: AnyBackendConfig, local_project_root: Path) -> None:
+    def ensure_built(
+        config: AnyBackendConfig, local_project_root: Path, *, allow_build: bool
+    ) -> bool:
         """
-        Validate E2B backend configuration and ensure template exists.
+        Validate E2B configuration and make sure the template exists.
 
-        Checks:
-        1. E2B API key is available (config or environment variable)
-        2. Dockerfile path exists (specified or default)
-        3. Project version is available (from config or pyproject.toml)
-        4. E2B template for current version exists (creates and builds if not)
-
-        If the template doesn't exist, it will be created from the Dockerfile and
-        built/deployed to E2B automatically. The version used for template naming
-        comes from config.template_version if provided, otherwise from pyproject.toml.
-
-        Args:
-            config: Backend configuration (must be E2B config)
-            local_project_root: Path to the local project root directory
+        Checks API key availability, Dockerfile existence, and template existence.
+        If the template is missing: builds it when allow_build is True, otherwise
+        raises MissingImageError (pointing at `remote-box build`).
 
         Raises:
+            TypeError: If config is not an E2B config
             ValueError: If validation fails
+            MissingImageError: If the template is missing and allow_build is False
         """
         if not isinstance(config, E2B):
             raise TypeError(f"E2BBackend requires E2B config, got {type(config)}")
 
         project_root_path = local_project_root.resolve()
+        api_key = _api_key(config)
+        dockerfile = resolve_dockerfile(config.dockerfile_path, local_project_root)
+        template_alias = _template_alias(config, local_project_root)
 
-        # Check API key availability (memoized)
-        api_key = _get_api_key(e2b_api_key=config.e2b_api_key)
+        if Template.alias_exists(alias=template_alias, api_key=api_key):
+            logger.info(f"E2B template '{template_alias}' already exists.")
+            return False
 
-        # Determine Dockerfile path (specified or default)
-        if config.dockerfile_path:
-            dockerfile = Path(config.dockerfile_path)
-            if not dockerfile.is_absolute():
-                dockerfile = project_root_path / dockerfile
-        else:
-            # Default to Dockerfile in project root
-            dockerfile = project_root_path / "Dockerfile"
+        if not allow_build:
+            raise MissingImageError(template_alias)
 
-        # Validate Dockerfile exists
-        if not dockerfile.exists():
-            raise ValueError(
-                f"Dockerfile not found at path: {dockerfile}. "
-                "Specify dockerfile_path in config or ensure Dockerfile exists in project root."
-            )
-        if not dockerfile.is_file():
-            raise ValueError(f"Dockerfile path is not a file: {dockerfile}")
-
-        # Get template alias (memoized)
-        template_alias = _get_template_alias(
-            template_prefix=config.template_prefix,
-            template_version=config.template_version,
-            local_project_root=local_project_root,
-        )
-
-        # Check if template exists, if not create and build it
-        template_exists = Template.alias_exists(alias=template_alias, api_key=api_key)
-
-        if not template_exists:
-            logger.info(f"E2B template '{template_alias}' does not exist. Creating and building...")
-
-            # Build and deploy the template
+        logger.info(f"E2B template '{template_alias}' does not exist. Creating and building...")
+        try:
             Template.build(
                 template=(
                     Template(file_context_path=str(project_root_path))
@@ -167,63 +83,63 @@ class E2BBackend:
                 on_build_logs=default_build_logger(),
                 api_key=api_key,
             )
+        except Exception:
+            # Another process may have built the same alias concurrently; if the
+            # template exists now, the goal is met and the failure is benign.
+            if Template.alias_exists(alias=template_alias, api_key=api_key):
+                logger.info(f"E2B template '{template_alias}' was built concurrently elsewhere.")
+                return False
+            raise
 
-            logger.info(f"E2B template '{template_alias}' successfully built and deployed.")
+        logger.info(f"E2B template '{template_alias}' successfully built and deployed.")
+        return True
 
     @staticmethod
-    async def execute(
-        config: AnyBackendConfig,
-        local_project_root: Path,
-        bash_script: str,
-        timeout_millis: int,
-    ) -> str:
-        """
-        Execute bash script in E2B sandbox and return raw stdout.
+    def image_name(config: AnyBackendConfig, local_project_root: Path) -> str | None:
+        if not isinstance(config, E2B):
+            raise TypeError(f"E2BBackend requires E2B config, got {type(config)}")
+        return _template_alias(config, local_project_root)
 
-        Args:
-            config: E2B backend configuration
-            local_project_root: Path to the local project root
-            bash_script: Bash script to execute in the sandbox
-            timeout_millis: Maximum execution time in milliseconds
-
-        Returns:
-            Raw stdout from execution as string
-
-        Raises:
-            TypeError: If config is not E2B config
-            ValueError: If execution fails
-        """
+    @staticmethod
+    async def acquire(
+        config: AnyBackendConfig, local_project_root: Path, timeout_millis: int
+    ) -> E2BHandle:
         if not isinstance(config, E2B):
             raise TypeError(f"E2BBackend requires E2B config, got {type(config)}")
 
-        # Create sandbox from template
-        async_sandbox = await AsyncSandbox.create(
-            # Get the template alias (memoized, same as used in pre_check)
-            template=_get_template_alias(
-                template_prefix=config.template_prefix,
-                template_version=config.template_version,
-                local_project_root=local_project_root,
-            ),
-            # Convert timeout from milliseconds to seconds for E2B
-            timeout=timeout_millis // 1000,
-            # Get API key from config or environment (memoized)
-            api_key=_get_api_key(e2b_api_key=config.e2b_api_key),
+        # The sandbox lifetime (TTL) is deliberately decoupled from the per-call
+        # timeout: sessions keep the sandbox alive across many calls by refreshing
+        # the TTL before each run.
+        sandbox = await AsyncSandbox.create(
+            template=_template_alias(config, local_project_root),
+            timeout=config.sandbox_ttl_seconds,
+            api_key=_api_key(config),
         )
+        return E2BHandle(sandbox=sandbox, ttl_seconds=config.sandbox_ttl_seconds)
+
+    @staticmethod
+    async def run(handle: E2BHandle, bash_script: str, timeout_millis: int) -> str:
+        # Refresh the sandbox lifetime so long-lived sessions don't expire mid-use.
+        await handle.sandbox.set_timeout(handle.ttl_seconds)
 
         try:
-            # Execute the bash script in the sandbox
-            result = await async_sandbox.commands.run(bash_script, user="root")
+            result = await handle.sandbox.commands.run(
+                bash_script,
+                user="root",
+                timeout=timeout_millis / 1000.0,
+            )
+        except CommandExitException as e:
+            raise RuntimeError(
+                f"Remote execution harness failed with exit code {e.exit_code}.\n"
+                f"stderr:\n{e.stderr}"
+            ) from e
+        except TimeoutException as e:
+            raise TimeoutError(
+                f"Remote execution exceeded timeout of {timeout_millis}ms: {e}"
+            ) from e
 
-            # Check for execution errors
-            if result.exit_code != 0:
-                raise ValueError(
-                    f"Bash script execution failed with exit code {result.exit_code}.\n"
-                    f"stdout: {result.stdout}\n"
-                    f"stderr: {result.stderr}"
-                )
+        return result.stdout
 
-            return result.stdout
-
-        finally:
-            # Always kill the sandbox to avoid resource leaks
-            await async_sandbox.kill()
+    @staticmethod
+    async def release(handle: E2BHandle) -> None:
+        await handle.sandbox.kill()

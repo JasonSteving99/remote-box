@@ -1,17 +1,29 @@
-#!/usr/bin/env {shell}
-# Execution harness: runs Python code in isolation and captures the result.
-# Python communicates its response via a temp file to avoid any accidental
-# collisions with logs the user code may emit to stdout.
+#!/usr/bin/env bash
+# Execution harness: runs Python code and captures the result via a temp file
+# so user prints on stdout can never corrupt the response channel. Stderr is
+# captured separately so interpreter-level failures (import errors, crashes)
+# can be surfaced to the caller instead of vanishing.
 
-# Create a unique temp file for IPC with PID to avoid conflicts
-RESULT_FILE="/tmp/remote_execution_result_$$"
-trap 'rm -f "$RESULT_FILE"' EXIT INT TERM
+RESULT_FILE="$(mktemp)"
+STDERR_FILE="$(mktemp)"
+trap 'rm -f "$RESULT_FILE" "$STDERR_FILE"' EXIT INT TERM
 
-# Run Python and pass the result file path as an env var
-# Redirect stdout and stderr to /dev/null to isolate from harness output
-REMOTE_EXECUTION_MODE=1 REMOTE_EXECUTION_RESULT_FILE="$RESULT_FILE" {python_cmd} >/dev/null 2>&1 <<'EOF'
+REMOTE_EXECUTION_MODE=1 REMOTE_EXECUTION_RESULT_FILE="$RESULT_FILE" {python_cmd} >/dev/null 2>"$STDERR_FILE" <<'REMOTE_BOX_EOF'
 {code}
-EOF
+REMOTE_BOX_EOF
+PY_EXIT=$?
 
-# Print the result to stdout (this is the only output from the harness)
-cat "$RESULT_FILE"
+# If the program wrote a response (success or structured error payload), emit it
+# and exit 0 — the caller distinguishes the two cases by parsing the payload.
+if [ -s "$RESULT_FILE" ]; then
+    cat "$RESULT_FILE"
+    exit 0
+fi
+
+# Nothing was written: the interpreter died before the error handler could run
+# (import error, syntax error, OOM, ...). Surface its stderr for debugging.
+cat "$STDERR_FILE" >&2
+if [ "$PY_EXIT" -eq 0 ]; then
+    PY_EXIT=1
+fi
+exit "$PY_EXIT"

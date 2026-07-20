@@ -1,4 +1,4 @@
-from typing import Any, Callable, Coroutine
+from typing import Any, Callable, Coroutine, Protocol
 from pydantic import BaseModel, ValidationError
 import inspect
 from pathlib import Path
@@ -7,31 +7,24 @@ import functools
 
 from remote.backends import (
     Subprocess,
-    BackendShell,
-    BackendType,
-    SHELL_EXECUTABLES,
     AnyBackendConfig,
-    Backend,
     RemoteExecutionErrorResponse,
     RemoteExecutionError,
+    RemoteExecutionProtocolError,
 )
-from remote.backends.subprocess import SubprocessBackend
-from remote.backends.e2b import E2BBackend
-from remote.backends.daytona import DaytonaBackend
-
-# Load the execution harness template
-_HARNESS_TEMPLATE_PATH = Path(__file__).parent / "execution_harness.sh.tmpl"
-_HARNESS_TEMPLATE = _HARNESS_TEMPLATE_PATH.read_text()
+from remote.runtime import register_target
+from remote.session import RemoteSession
 
 EXECUTION_TEMPLATE = """
 import asyncio
 import json
 import os
 import sys
+import traceback
 
 def _write_result(result_file: str, data: str):
     with open(result_file, 'w') as f:
-        print(data, file=f)
+        f.write(data)
 
 async def execute():
     result_file = os.environ.get('REMOTE_EXECUTION_RESULT_FILE')
@@ -42,15 +35,16 @@ async def execute():
     try:
         {import_model}
         {import_func}
-        res = await {func_name}({arg})
+        arg = {model_name}.model_validate_json({arg_json})
+        res = await {func_name}(arg)
         _write_result(result_file, res.model_dump_json())
     except Exception as e:
-        error_response = json.dumps({{
-            "__remote_execution_error__": True,
+        _write_result(result_file, json.dumps({{
+            "remote_execution_error": True,
             "error_type": type(e).__name__,
             "error_message": str(e),
-        }})
-        _write_result(result_file, error_response)
+            "traceback": traceback.format_exc(),
+        }}))
         print(f"Remote execution failed: {{e}}", file=sys.stderr)
         sys.exit(1)
 
@@ -59,24 +53,20 @@ if __name__ == "__main__":
 
 """
 
-# Registry mapping backend types to their implementations
-_BACKEND_REGISTRY: dict[BackendType, type[Backend]] = {
-    BackendType.SUBPROCESS: SubprocessBackend,
-    BackendType.E2B: E2BBackend,
-    BackendType.DAYTONA: DaytonaBackend,
-}
 
-# Cache to track which backend configurations have been pre-checked
-# Uses list since Pydantic models aren't hashable but support equality comparison.
-# Checking such a short list is likely just as (or more) efficient than checking a set anyways.
-_PRECHECKED_CONFIGS: list[AnyBackendConfig] = []
+class RemoteFunction[I: BaseModel, O: BaseModel](Protocol):
+    """A decorated remote function: callable directly, or against a RemoteSession."""
+
+    def __call__(
+        self, arg: I, *, session: RemoteSession | None = None
+    ) -> Coroutine[Any, Any, O]: ...
 
 
 def remote[I: BaseModel, O: BaseModel](
     local_project_root: Path,
-    backend: AnyBackendConfig = Subprocess(shell=BackendShell.ZSH),
+    backend: AnyBackendConfig = Subprocess(),
     timeout_millis: int = 300000,  # 5 minutes default
-) -> Callable[[Callable[[I], Coroutine[Any, Any, O]]], Callable[[I], Coroutine[Any, Any, O]]]:
+) -> Callable[[Callable[[I], Coroutine[Any, Any, O]]], RemoteFunction[I, O]]:
     """
     Decorator that executes a function remotely using the specified backend.
 
@@ -84,9 +74,14 @@ def remote[I: BaseModel, O: BaseModel](
     - Take exactly one parameter of type BaseModel (or subclass)
     - Return a BaseModel (or subclass)
 
+    Applying the decorator has no side effects beyond registering the backend
+    target. Backend images are built lazily on first call (unless disabled via
+    REMOTE_BOX_AUTO_BUILD=false or auto_build_override) or explicitly via
+    `remote-box build` / `remote.build_all()`.
+
     Args:
         local_project_root: Root directory of the project for resolving imports
-        backend: Backend configuration (default: Subprocess with ZSH for macOS compatibility)
+        backend: Backend configuration (default: Subprocess)
         timeout_millis: Maximum execution time in milliseconds (default: 300000 = 5 minutes)
 
     Usage:
@@ -98,64 +93,84 @@ def remote[I: BaseModel, O: BaseModel](
 
         @remote(
             local_project_root=Path(__file__).parent,
-            backend=Subprocess(shell=BackendShell.BASH4),
+            backend=Daytona(snapshot_name="my-project"),
             timeout_millis=60000
         )
         async def my_function(input: InputModel) -> OutputModel:
             return OutputModel(greeting=f"Hello {input.name}")
+
+        # One-shot (fresh sandbox per call):
+        result = await my_function(InputModel(name="World"))
+
+        # Reusing one sandbox across calls:
+        async with RemoteSession(backend=..., local_project_root=...) as session:
+            await my_function(InputModel(name="a"), session=session)
+            await my_function(InputModel(name="b"), session=session)
     """
-    # Get the backend implementation from the registry
-    backend_impl = _BACKEND_REGISTRY[backend.type]
+    # Record the target so `remote-box build` / build_all() can find it.
+    # Deliberately no network access or builds at import time.
+    register_target(backend, local_project_root)
 
-    # Run pre-checks when the decorator is first applied (at import time)
-    # Skip pre-checks if we're already in remote execution mode
-    # Only run once per unique backend configuration for performance
-    if os.environ.get("REMOTE_EXECUTION_MODE") != "1" and backend not in _PRECHECKED_CONFIGS:
-        backend_impl.pre_check(backend, local_project_root)
-        _PRECHECKED_CONFIGS.append(backend)
-
-    def decorator(
-        func: Callable[[I], Coroutine[Any, Any, O]],
-    ) -> Callable[[I], Coroutine[Any, Any, O]]:
-        # Extract the actual output model class from the return type annotation
-        # For async functions, the annotation is the output type directly (not wrapped in Coroutine)
-        output_model_class = inspect.get_annotations(func)["return"]
-
-        backend_shell = SHELL_EXECUTABLES[backend.shell]
+    def decorator(func: Callable[[I], Coroutine[Any, Any, O]]) -> RemoteFunction[I, O]:
+        # Extract the actual output model class from the return type annotation.
+        # For async functions, the annotation is the output type directly (not
+        # wrapped in Coroutine). eval_str handles `from __future__ import annotations`.
+        output_model_class: type[BaseModel] = inspect.get_annotations(func, eval_str=True)[
+            "return"
+        ]
 
         @functools.wraps(func)
-        async def wrapper(arg: I) -> O:
+        async def wrapper(arg: I, *, session: RemoteSession | None = None) -> O:
             # If we're already in remote execution mode, just call the function directly
             if os.environ.get("REMOTE_EXECUTION_MODE") == "1":
                 return await func(arg)
 
-            # Generate the Python code with the actual argument
+            # Generate the Python program that re-imports the function and its input
+            # model remotely and reconstructs the argument from JSON. The JSON is
+            # embedded as a Python string literal via repr(), which round-trips any
+            # string safely — unlike repr() of the model itself, this handles
+            # datetimes, enums, nested models, etc. and is not an injection surface.
             python_code = EXECUTION_TEMPLATE.format(
                 import_model=__get_import_path(type(arg), local_project_root),
                 import_func=__get_import_path(func, local_project_root),
+                model_name=type(arg).__name__,
                 func_name=func.__name__,
-                arg=arg.__repr__(),
+                arg_json=repr(arg.model_dump_json()),
             )
 
-            # Wrap the Python code in the execution harness bash script
-            bash_script = _HARNESS_TEMPLATE.format(shell=backend_shell, python_cmd=backend_impl.PYTHON_CMD, code=python_code)
+            if session is not None:
+                stdout_str = await session.run_code(python_code, timeout_millis=timeout_millis)
+            else:
+                # One-shot mode: acquire a fresh sandbox just for this call.
+                async with RemoteSession(
+                    backend=backend,
+                    local_project_root=local_project_root,
+                    timeout_millis=timeout_millis,
+                ) as ephemeral:
+                    stdout_str = await ephemeral.run_code(python_code)
 
-            # Execute using the configured backend with timeout
-            stdout_str = await backend_impl.execute(
-                backend, local_project_root, bash_script, timeout_millis
-            )
+            return __parse_response(output_model_class, stdout_str)  # type: ignore[return-value]
 
-            # Parse the response, trying happy path first
-            try:
-                return output_model_class.model_validate_json(stdout_str)
-            except ValidationError:
-                # If that fails, try parsing as error response
-                error_response = RemoteExecutionErrorResponse.model_validate_json(stdout_str)
-                raise RemoteExecutionError(error_response)
-
-        return wrapper
+        return wrapper  # type: ignore[return-value]
 
     return decorator
+
+
+def __parse_response(output_model_class: type[BaseModel], stdout_str: str) -> BaseModel:
+    """Parse harness stdout as an error payload first, then as the output model."""
+    # Error payloads carry an explicit sentinel field, so check them first — an
+    # output model with lenient/defaulted fields can't accidentally swallow one.
+    try:
+        error_response = RemoteExecutionErrorResponse.model_validate_json(stdout_str)
+    except ValidationError:
+        pass
+    else:
+        raise RemoteExecutionError(error_response)
+
+    try:
+        return output_model_class.model_validate_json(stdout_str)
+    except ValidationError as e:
+        raise RemoteExecutionProtocolError(stdout_str) from e
 
 
 def __get_import_path(obj, local_project_root: Path) -> str:

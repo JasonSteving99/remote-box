@@ -1,89 +1,36 @@
 import base64
-import os
-from pathlib import Path
-from remote.backends import Daytona, AnyBackendConfig
-import daytona as daytona_sdk
-import tomllib
+from dataclasses import dataclass
 from logging import getLogger
-from functools import cache
+from pathlib import Path
+
+import daytona as daytona_sdk
+
+from remote.backends import AnyBackendConfig, Daytona, MissingImageError
+from remote.backends._common import image_name, require_api_key, resolve_dockerfile
 
 logger = getLogger(__name__)
 
 
-@cache
-def _get_api_key(*, daytona_api_key: str | None) -> str:
-    """
-    Get the Daytona API key from config or environment.
-
-    This function is memoized to avoid repeated environment variable lookups.
-
-    Args:
-        daytona_api_key: API key from config (optional)
-
-    Returns:
-        Daytona API key string
-
-    Raises:
-        ValueError: If API key cannot be found
-    """
-    api_key = daytona_api_key or os.environ.get("DAYTONA_API_KEY")
-    if not api_key:
-        raise ValueError(
-            "Daytona API key is required. Provide it in the config or set the DAYTONA_API_KEY environment variable."
-        )
-    return api_key
+def _snapshot_name(config: Daytona, local_project_root: Path) -> str:
+    dockerfile = resolve_dockerfile(config.dockerfile_path, local_project_root)
+    return image_name(
+        prefix=config.snapshot_name,
+        version=config.snapshot_version,
+        dockerfile=dockerfile,
+        local_project_root=local_project_root,
+    )
 
 
-@cache
-def _get_snapshot_name(
-    *,
-    snapshot_name: str,
-    snapshot_version: str | None,
-    local_project_root: Path,
-) -> str:
-    """
-    Get the full Daytona snapshot name for the given configuration.
+def _api_key(config: Daytona) -> str:
+    return require_api_key(config.daytona_api_key, "DAYTONA_API_KEY", "Daytona")
 
-    Determines the snapshot version from snapshot_version if provided,
-    otherwise reads it from pyproject.toml. Returns the formatted snapshot name
-    string: {snapshot_name}-v{version}
 
-    This function is memoized to avoid repeated file I/O when determining the
-    snapshot name across multiple decorator invocations with the same config.
+@dataclass
+class DaytonaHandle:
+    """Handle for a live Daytona sandbox (owns the client used to create it)."""
 
-    Args:
-        snapshot_name: Prefix for Daytona snapshot naming
-        snapshot_version: Optional version string. If None, reads from pyproject.toml
-        local_project_root: Path to the local project root directory
-
-    Returns:
-        Snapshot name string in format: {snapshot_name}-v{version}
-
-    Raises:
-        ValueError: If version cannot be determined
-    """
-    project_root_path = local_project_root.resolve()
-
-    if snapshot_version:
-        version = snapshot_version
-    else:
-        pyproject_path = project_root_path / "pyproject.toml"
-        if not pyproject_path.exists():
-            raise ValueError(
-                f"pyproject.toml not found in project root: {project_root_path}. "
-                "Daytona backend requires project version."
-            )
-
-        with open(pyproject_path, "rb") as f:
-            pyproject_data = tomllib.load(f)
-
-        version = pyproject_data.get("project", {}).get("version")
-        if not version:
-            raise ValueError(
-                "Project version not found in pyproject.toml. Daytona backend requires a version."
-            )
-
-    return f"{snapshot_name}-v{version}"
+    client: daytona_sdk.AsyncDaytona
+    sandbox: daytona_sdk.AsyncSandbox
 
 
 class DaytonaBackend:
@@ -92,61 +39,44 @@ class DaytonaBackend:
     PYTHON_CMD: str = "/app/.venv/bin/python"
 
     @staticmethod
-    def pre_check(config: AnyBackendConfig, local_project_root: Path) -> None:
+    def ensure_built(
+        config: AnyBackendConfig, local_project_root: Path, *, allow_build: bool
+    ) -> bool:
         """
-        Validate Daytona backend configuration and ensure snapshot exists.
+        Validate Daytona configuration and make sure the snapshot exists.
 
-        Checks:
-        1. Daytona API key is available (config or environment variable)
-        2. Dockerfile path exists (specified or default)
-        3. Project version is available (from config or pyproject.toml)
-        4. Daytona snapshot for current version exists (creates and builds if not)
-
-        Args:
-            config: Backend configuration (must be Daytona config)
-            local_project_root: Path to the local project root directory
+        Checks API key availability, Dockerfile existence, and snapshot existence.
+        If the snapshot is missing: builds it when allow_build is True, otherwise
+        raises MissingImageError (pointing at `remote-box build`).
 
         Raises:
+            TypeError: If config is not a Daytona config
             ValueError: If validation fails
+            MissingImageError: If the snapshot is missing and allow_build is False
         """
         if not isinstance(config, Daytona):
             raise TypeError(f"DaytonaBackend requires Daytona config, got {type(config)}")
 
-        project_root_path = local_project_root.resolve()
-
-        api_key = _get_api_key(daytona_api_key=config.daytona_api_key)
-
-        if config.dockerfile_path:
-            dockerfile = Path(config.dockerfile_path)
-            if not dockerfile.is_absolute():
-                dockerfile = project_root_path / dockerfile
-        else:
-            dockerfile = project_root_path / "Dockerfile"
-
-        if not dockerfile.exists():
-            raise ValueError(
-                f"Dockerfile not found at path: {dockerfile}. "
-                "Specify dockerfile_path in config or ensure Dockerfile exists in project root."
-            )
-        if not dockerfile.is_file():
-            raise ValueError(f"Dockerfile path is not a file: {dockerfile}")
-
-        full_snapshot_name = _get_snapshot_name(
-            snapshot_name=config.snapshot_name,
-            snapshot_version=config.snapshot_version,
-            local_project_root=local_project_root,
-        )
+        api_key = _api_key(config)
+        dockerfile = resolve_dockerfile(config.dockerfile_path, local_project_root)
+        full_snapshot_name = _snapshot_name(config, local_project_root)
 
         client = daytona_sdk.Daytona(daytona_sdk.DaytonaConfig(api_key=api_key))
 
         try:
             client.snapshot.get(full_snapshot_name)
             logger.info(f"Daytona snapshot '{full_snapshot_name}' already exists.")
+            return False
         except daytona_sdk.DaytonaNotFoundError:
-            logger.info(
-                f"Daytona snapshot '{full_snapshot_name}' does not exist. Creating and building..."
-            )
+            pass
 
+        if not allow_build:
+            raise MissingImageError(full_snapshot_name)
+
+        logger.info(
+            f"Daytona snapshot '{full_snapshot_name}' does not exist. Creating and building..."
+        )
+        try:
             client.snapshot.create(
                 daytona_sdk.CreateSnapshotParams(
                     name=full_snapshot_name,
@@ -157,61 +87,71 @@ class DaytonaBackend:
                         disk=config.disk_gb,
                     ),
                 ),
-                on_logs=lambda msg: print(f"[Daytona snapshot build] {msg}"),
+                on_logs=lambda msg: logger.info(f"[Daytona snapshot build] {msg}"),
             )
+        except Exception:
+            # Another process may have built the same snapshot concurrently; if it
+            # exists now, the goal is met and the failure is benign.
+            try:
+                client.snapshot.get(full_snapshot_name)
+                logger.info(
+                    f"Daytona snapshot '{full_snapshot_name}' was built concurrently elsewhere."
+                )
+                return False
+            except daytona_sdk.DaytonaNotFoundError:
+                pass
+            raise
 
-            logger.info(f"Daytona snapshot '{full_snapshot_name}' successfully built.")
+        logger.info(f"Daytona snapshot '{full_snapshot_name}' successfully built.")
+        return True
 
     @staticmethod
-    async def execute(
-        config: AnyBackendConfig,
-        local_project_root: Path,
-        bash_script: str,
-        timeout_millis: int,
-    ) -> str:
-        """
-        Execute bash script in a Daytona sandbox and return raw stdout.
+    def image_name(config: AnyBackendConfig, local_project_root: Path) -> str | None:
+        if not isinstance(config, Daytona):
+            raise TypeError(f"DaytonaBackend requires Daytona config, got {type(config)}")
+        return _snapshot_name(config, local_project_root)
 
-        Args:
-            config: Daytona backend configuration
-            local_project_root: Path to the local project root
-            bash_script: Bash script to execute in the sandbox
-            timeout_millis: Maximum execution time in milliseconds
-
-        Returns:
-            Raw stdout from execution as string
-
-        Raises:
-            TypeError: If config is not Daytona config
-            ValueError: If execution fails
-        """
+    @staticmethod
+    async def acquire(
+        config: AnyBackendConfig, local_project_root: Path, timeout_millis: int
+    ) -> DaytonaHandle:
         if not isinstance(config, Daytona):
             raise TypeError(f"DaytonaBackend requires Daytona config, got {type(config)}")
 
-        api_key = _get_api_key(daytona_api_key=config.daytona_api_key)
-        full_snapshot_name = _get_snapshot_name(
-            snapshot_name=config.snapshot_name,
-            snapshot_version=config.snapshot_version,
-            local_project_root=local_project_root,
-        )
-
-        async with daytona_sdk.AsyncDaytona(daytona_sdk.DaytonaConfig(api_key=api_key)) as daytona:
-            sandbox = await daytona.create(
-                daytona_sdk.CreateSandboxFromSnapshotParams(snapshot=full_snapshot_name),
-                timeout=timeout_millis / 1000.0,
+        client = daytona_sdk.AsyncDaytona(daytona_sdk.DaytonaConfig(api_key=_api_key(config)))
+        try:
+            sandbox = await client.create(
+                daytona_sdk.CreateSandboxFromSnapshotParams(
+                    snapshot=_snapshot_name(config, local_project_root)
+                ),
+                timeout=config.create_timeout_seconds,
             )
-            try:
-                # process.exec() runs through sh, which ignores the shebang and doesn't
-                # support bash 4+ dynamic FD syntax. Write the script to a temp file via
-                # base64 (safe against quoting issues) and execute it explicitly with bash.
-                encoded = base64.b64encode(bash_script.encode()).decode()
-                command = f"printf '%s' '{encoded}' | base64 -d > /tmp/remote_exec_harness.sh && bash /tmp/remote_exec_harness.sh"
-                result = await sandbox.process.exec(command, timeout=int(timeout_millis / 1000))
-                if result.exit_code != 0:
-                    raise ValueError(
-                        f"Bash script execution failed with exit code {result.exit_code}.\n"
-                        f"stdout: {result.result}"
-                    )
-                return result.result
-            finally:
-                await daytona.delete(sandbox)
+        except BaseException:
+            await client.close()
+            raise
+        return DaytonaHandle(client=client, sandbox=sandbox)
+
+    @staticmethod
+    async def run(handle: DaytonaHandle, bash_script: str, timeout_millis: int) -> str:
+        # process.exec() runs through sh, which ignores the shebang and lacks some
+        # bash features the harness relies on. Pipe the script through base64 into an
+        # explicit bash process — safe against quoting issues and leaves no temp
+        # files behind to collide across calls sharing the sandbox.
+        encoded = base64.b64encode(bash_script.encode()).decode()
+        command = f"printf '%s' '{encoded}' | base64 -d | bash"
+        result = await handle.sandbox.process.exec(
+            command, timeout=max(1, int(timeout_millis / 1000))
+        )
+        if result.exit_code != 0:
+            raise RuntimeError(
+                f"Remote execution harness failed with exit code {result.exit_code}.\n"
+                f"output:\n{result.result}"
+            )
+        return result.result
+
+    @staticmethod
+    async def release(handle: DaytonaHandle) -> None:
+        try:
+            await handle.client.delete(handle.sandbox)
+        finally:
+            await handle.client.close()
