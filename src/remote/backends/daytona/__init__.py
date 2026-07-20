@@ -1,3 +1,4 @@
+import asyncio
 import base64
 from dataclasses import dataclass
 from logging import getLogger
@@ -150,8 +151,64 @@ class DaytonaBackend:
         return result.result
 
     @staticmethod
+    def sandbox_id(handle: DaytonaHandle) -> str | None:
+        return handle.sandbox.id
+
+    @staticmethod
+    async def pause(handle: DaytonaHandle) -> None:
+        # Daytona pause retains memory state as well as disk, but not every
+        # sandbox class supports it. Fall back to stop() — disk-only
+        # persistence — which start() resumes all the same.
+        try:
+            await handle.sandbox.pause()
+        except daytona_sdk.DaytonaError as e:
+            if "not supported" not in str(e).lower():
+                raise
+            logger.info(f"Sandbox pause unsupported, falling back to stop(): {e}")
+            await handle.sandbox.stop()
+
+    @staticmethod
+    async def resume(handle: DaytonaHandle) -> None:
+        await handle.sandbox.start()
+
+    @staticmethod
+    async def reconnect(
+        config: AnyBackendConfig,
+        sandbox_id: str | None,
+        local_project_root: Path,
+        timeout_millis: int,
+    ) -> DaytonaHandle:
+        if not isinstance(config, Daytona):
+            raise TypeError(f"DaytonaBackend requires Daytona config, got {type(config)}")
+        if sandbox_id is None:
+            raise ValueError("Daytona reconnect requires a sandbox_id")
+
+        client = daytona_sdk.AsyncDaytona(daytona_sdk.DaytonaConfig(api_key=_api_key(config)))
+        try:
+            sandbox = await client.get(sandbox_id)
+            if sandbox.state != daytona_sdk.SandboxState.STARTED:
+                await sandbox.start(timeout=config.create_timeout_seconds)
+        except BaseException:
+            await client.close()
+            raise
+        return DaytonaHandle(client=client, sandbox=sandbox)
+
+    @staticmethod
     async def release(handle: DaytonaHandle) -> None:
         try:
-            await handle.client.delete(handle.sandbox)
+            for attempt in range(5):
+                try:
+                    await handle.client.delete(handle.sandbox)
+                    break
+                except daytona_sdk.DaytonaNotFoundError:
+                    # Already deleted — e.g. a session rehydrated from this
+                    # sandbox's SessionRef closed it first. Goal state met.
+                    break
+                except daytona_sdk.DaytonaConflictError:
+                    # A state change is in progress (possibly another session's
+                    # delete of this same sandbox finishing) — retry briefly.
+                    if attempt == 4:
+                        raise
+                    await asyncio.sleep(0.5 * 2**attempt)
         finally:
             await handle.client.close()

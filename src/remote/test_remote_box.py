@@ -97,19 +97,133 @@ async def read_file(arg: FileOp) -> FileResult:
 
 
 def test_session_write_then_read():
-    """Consecutive calls through one session share an environment."""
+    """Calls inside `async with session:` pick the session up implicitly."""
 
     async def scenario() -> str:
         with tempfile.TemporaryDirectory() as tmpdir:
             target = str(Path(tmpdir) / "state.txt")
-            async with RemoteSession(
-                backend=Subprocess(), local_project_root=PROJECT_ROOT
-            ) as session:
-                await write_file(FileOp(path=target, content="persisted!"), session=session)
-                result = await read_file(FileOp(path=target), session=session)
+            async with RemoteSession(backend=Subprocess(), local_project_root=PROJECT_ROOT):
+                await write_file(FileOp(path=target, content="persisted!"))
+                result = await read_file(FileOp(path=target))
             return result.content
 
     assert asyncio.run(scenario()) == "persisted!"
+
+
+def test_decorated_signature_exposes_only_the_input_model():
+    """AI SDKs reflect tool signatures to build schemas — no session/kwargs allowed.
+
+    Checked without following __wrapped__, i.e. on the wrapper actually invoked.
+    """
+    import inspect
+
+    sig = inspect.signature(write_file, follow_wrapped=False)
+    assert list(sig.parameters) == ["arg"]
+
+
+def test_scope_exit_only_closes_owned_sessions():
+    """`async with` on a pre-started session must not destroy the sandbox."""
+
+    async def scenario() -> None:
+        session = RemoteSession(backend=Subprocess(), local_project_root=PROJECT_ROOT)
+
+        # Bare `async with` owns: sandbox created on entry, destroyed on exit.
+        async with session:
+            assert session._handle is not None
+        assert session._handle is None
+
+        # Explicitly started: scopes only activate; close() is the owner's call.
+        await session.start()
+        async with session:
+            assert session._handle is not None
+        assert session._handle is not None
+        await session.close()
+        assert session._handle is None
+
+    asyncio.run(scenario())
+
+
+def test_framework_lifecycle_with_pause_and_ref_resume():
+    """The agent-framework flow: start, scoped calls, pause, rehydrate from ref, close."""
+    from remote import SessionRef
+
+    async def scenario() -> str:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = str(Path(tmpdir) / "state.txt")
+
+            session = await RemoteSession(
+                backend=Subprocess(), local_project_root=PROJECT_ROOT
+            ).start()
+            async with session:
+                await write_file(FileOp(path=target, content="survived the pause"))
+
+            ref = await session.pause()
+            assert isinstance(ref, SessionRef)
+            assert ref.backend == "SUBPROCESS"
+            assert ref.sandbox_id is None  # subprocess has no persistent sandbox
+
+            # Re-entering a paused session transparently resumes it.
+            async with session:
+                assert (await read_file(FileOp(path=target))).content == "survived the pause"
+            await session.close()
+
+            # Rehydrating from a serialized ref (as a new process would).
+            rehydrated = await RemoteSession.resume(
+                SessionRef.model_validate_json(ref.model_dump_json()),
+                backend=Subprocess(),
+                local_project_root=PROJECT_ROOT,
+            )
+            async with rehydrated:
+                result = await read_file(FileOp(path=target))
+            await rehydrated.close()
+            return result.content
+
+    assert asyncio.run(scenario()) == "survived the pause"
+
+
+def test_resume_rejects_mismatched_backend():
+    from remote import Daytona, SessionRef
+
+    async def scenario() -> None:
+        ref = SessionRef(backend="DAYTONA", sandbox_id="abc123")
+        with pytest.raises(ValueError, match="DAYTONA"):
+            await RemoteSession.resume(
+                ref, backend=Subprocess(), local_project_root=PROJECT_ROOT
+            )
+        # And the config type must exist in the error path both ways
+        ref = SessionRef(backend="SUBPROCESS")
+        with pytest.raises(ValueError, match="SUBPROCESS"):
+            await RemoteSession.resume(
+                ref,
+                backend=Daytona(snapshot_name="x"),
+                local_project_root=PROJECT_ROOT,
+            )
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_tasks_see_their_own_ambient_session():
+    """Context vars snapshot per task: a task spawned outside a scope stays one-shot."""
+    from remote.session import current_session
+
+    async def scenario() -> tuple[bool, bool]:
+        session = RemoteSession(backend=Subprocess(), local_project_root=PROJECT_ROOT)
+        outside_task = asyncio.create_task(asyncio.sleep(0))  # snapshots empty context
+
+        async with session:
+            inside = current_session() is session
+            spawned = asyncio.create_task(_ambient_is(session))
+            inside_task = await spawned
+        await outside_task
+        outside = current_session() is None
+        return inside and inside_task, outside
+
+    async def _ambient_is(expected: RemoteSession) -> bool:
+        return current_session() is expected
+
+    inside_ok, outside_ok = asyncio.run(scenario())
+    assert inside_ok
+    assert outside_ok
 
 
 class NoiseInput(BaseModel):

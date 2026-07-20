@@ -5,7 +5,7 @@ with type-safe inputs and outputs, including reusable sandbox sessions.
 """
 
 from remote.decorator import remote, RemoteFunction
-from remote.session import RemoteSession
+from remote.session import RemoteSession, current_session
 from remote.runtime import build_all
 from remote.backends import (
     BackendType,
@@ -18,6 +18,7 @@ from remote.backends import (
     RemoteExecutionError,
     RemoteExecutionErrorResponse,
     RemoteExecutionProtocolError,
+    SessionRef,
 )
 
 __all__ = [
@@ -26,6 +27,8 @@ __all__ = [
     "RemoteFunction",
     # Sandbox sessions
     "RemoteSession",
+    "SessionRef",
+    "current_session",
     # Explicit image building (CI/CD)
     "build_all",
     # Backend types and configs

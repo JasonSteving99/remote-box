@@ -127,6 +127,28 @@ class Daytona(BackendConfig[Literal[BackendType.DAYTONA]]):
 AnyBackendConfig = Subprocess | E2B | Daytona
 
 
+class SessionRef(BaseModel):
+    """Serializable pointer to a live (possibly paused) sandbox.
+
+    Produced by `RemoteSession.ref` / `RemoteSession.pause()` and consumed by
+    `RemoteSession.resume()` — potentially in a different process (an agent
+    framework can persist it in its state store while the agent idles, then
+    rehydrate the session when work resumes).
+
+    Deliberately contains no credentials or backend config: callers re-supply
+    the backend config at resume time, so persisted refs never carry secrets.
+    """
+
+    backend: str = Field(
+        ...,
+        description="BackendType member name (e.g. 'DAYTONA') — stored by name so refs stay valid across releases.",
+    )
+    sandbox_id: Optional[str] = Field(
+        default=None,
+        description="Provider-assigned sandbox ID; None for backends with no persistent sandbox (subprocess).",
+    )
+
+
 class RemoteExecutionErrorResponse(BaseModel):
     """Response model for remote execution errors.
 
@@ -181,7 +203,9 @@ class Backend(Protocol):
 
     The lifecycle is split so a sandbox can be reused across calls:
     `acquire` once, `run` any number of scripts against the same sandbox
-    (its filesystem persists between runs), then `release`.
+    (its filesystem persists between runs), then `release`. Long-lived
+    sessions can additionally `pause`/`resume` the sandbox between bursts of
+    calls, and `reconnect` to it by ID from a different process.
     """
 
     PYTHON_CMD: str
@@ -258,6 +282,59 @@ class Backend(Protocol):
         Raises:
             TimeoutError: If execution exceeds timeout_millis
             Exception: If execution fails
+        """
+        ...
+
+    @staticmethod
+    def sandbox_id(handle: Any) -> Optional[str]:
+        """
+        Provider-assigned ID of the live sandbox, for building a SessionRef.
+
+        Returns None for backends with no persistent sandbox (subprocess).
+        """
+        ...
+
+    @staticmethod
+    async def pause(handle: Any) -> None:
+        """
+        Pause the sandbox so it stops consuming compute while idle.
+
+        The sandbox must be resumable afterwards — either in-place via `resume`
+        or from another process via `reconnect`. No-op for backends with no
+        persistent sandbox.
+        """
+        ...
+
+    @staticmethod
+    async def resume(handle: Any) -> None:
+        """
+        Resume a sandbox previously paused via `pause`, using the live handle.
+
+        Only called in the same process that paused; cross-process resume goes
+        through `reconnect` instead.
+        """
+        ...
+
+    @staticmethod
+    async def reconnect(
+        config: AnyBackendConfig,
+        sandbox_id: Optional[str],
+        local_project_root: Path,
+        timeout_millis: int,
+    ) -> Any:
+        """
+        Reattach to an existing sandbox by ID and return a fresh handle.
+
+        Resumes the sandbox if it is paused. Used to rehydrate a session in a
+        new process from a persisted SessionRef, so it must not assume any
+        in-process state (clients, locks) survived.
+
+        Args:
+            config: The backend configuration (same one used to create the sandbox)
+            sandbox_id: Provider-assigned sandbox ID from SessionRef; None only
+                for backends with no persistent sandbox
+            local_project_root: Path to the local project root directory
+            timeout_millis: Maximum time to wait for reattachment
         """
         ...
 

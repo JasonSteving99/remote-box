@@ -39,12 +39,13 @@ print(result.greeting)  # "Hello World!"
 ```
 
 The first call builds the sandbox image from your `Dockerfile` automatically (see
-[Building images](#building-images-local-dev-vs-cicd) to move that into CI/CD instead).
+[Building images](#building-images-local-dev-vs-cicd) to move that into CI/CD instead of dynamically at runtime).
 
 ## Features
 
 - **Type-safe**: Inputs/outputs validated using Pydantic models; arguments travel as JSON, so `datetime`, enums, and nested models all work
-- **Reusable sandboxes**: `RemoteSession` runs consecutive calls in the *same* sandbox — write a file in one call, read it in the next
+- **Reusable sandboxes**: `RemoteSession` runs consecutive calls in the *same* sandbox — write a file in one call, read it in the next 
+- **Agent-framework ready**: explicit `start`/`pause`/`resume`/`close` lifecycle with serializable session refs, so sandboxes can survive agent idle periods and process restarts
 - **Multiple backends**:
   - [E2B](https://e2b.dev) — Remote secure sandboxes
   - [Daytona](https://daytona.io) — Remote sandboxes with snapshot-based images
@@ -56,7 +57,8 @@ The first call builds the sandbox image from your `Dockerfile` automatically (se
 ## Sessions: consecutive calls in one sandbox
 
 By default every call gets a fresh sandbox that is destroyed afterwards. To share
-one sandbox (and its filesystem) across calls, pass a `RemoteSession`:
+one sandbox (and its filesystem) across calls, run them inside a `RemoteSession`
+scope — calls pick the session up **implicitly**:
 
 ```python
 from remote import RemoteSession, Daytona
@@ -64,11 +66,17 @@ from remote import RemoteSession, Daytona
 async with RemoteSession(
     backend=Daytona(snapshot_name="my-project"),
     local_project_root=Path(__file__).parent,
-) as session:
-    await write_file(WriteInput(path="/tmp/state.json", data="..."), session=session)
-    result = await read_file(ReadInput(path="/tmp/state.json"), session=session)
+):
+    await write_file(WriteInput(path="/tmp/state.json", data="..."))
+    result = await read_file(ReadInput(path="/tmp/state.json"))
 # sandbox destroyed on exit
 ```
+
+There is deliberately **no `session=` parameter** on decorated functions: their
+signature is exactly the input model, so frameworks that reflect tool signatures
+(e.g. AI agent SDKs building tool schemas) never see session plumbing. Session
+propagation uses a context variable, which flows correctly across `await`
+boundaries and into `asyncio.create_task`.
 
 Notes:
 
@@ -80,6 +88,61 @@ Notes:
   `await session.start()` / `await session.close()` explicitly.
 - E2B sandboxes have a lifetime TTL (`sandbox_ttl_seconds`, default 600s) that is
   refreshed before every call, so a session stays alive as long as you keep using it.
+
+## Explicitly managing sandbox lifecycles: start, pause, resume, close
+
+`async with` on a session that was **not** explicitly started owns the sandbox: it
+is created on entry and destroyed on exit (the example above). If the session was
+already started with `await session.start()`, `async with` only *activates* it for
+the scope — whoever started it decides when it dies. This lets a framework (e.g.
+an AI agent runtime that auto-sandboxes tools) manage one sandbox across many tool
+calls:
+
+```python
+session = RemoteSession(backend=Daytona(...), local_project_root=...)
+await session.start()                 # framework owns the sandbox
+
+async with session:                   # per tool call — activates, doesn't destroy
+    result = await some_tool(input)   # session picked up implicitly
+
+ref = await session.pause()           # agent idles (e.g. waiting on human input):
+                                      # sandbox stops consuming compute
+
+async with session:                   # transparently resumes the paused sandbox
+    result = await another_tool(input)
+
+await session.close()                 # only at agent termination
+```
+
+`pause()` returns a `SessionRef` — a small, secret-free, JSON-serializable pointer
+to the sandbox (`session.ref` works any time after start). Persist it anywhere and
+reattach later, **even from a different process**:
+
+```python
+# process A
+ref_json = (await session.pause()).model_dump_json()
+
+# process B, an hour later
+session = await RemoteSession.resume(
+    SessionRef.model_validate_json(ref_json),
+    backend=Daytona(...),             # refs carry no credentials — config is re-supplied
+    local_project_root=...,
+)
+async with session:
+    result = await next_tool(input)
+```
+
+Pause/resume semantics per backend:
+
+| Backend | `pause()` | Preserved | Cross-process resume |
+|---------|-----------|-----------|----------------------|
+| Daytona | native pause; falls back to stop if the sandbox class doesn't support pausing | filesystem and memory (filesystem only on the stop fallback) | `client.get(id)` + start |
+| E2B | native sandbox pause | filesystem **and** memory | `AsyncSandbox.connect(id)` |
+| Subprocess | no-op (nothing to pause) | local filesystem trivially | fresh handle |
+
+Prefer pausing at genuine idle points rather than after every call — a
+pause/resume round trip costs a few seconds on the cloud backends. Daytona users
+can also set an auto-pause interval on the platform side as a safety net.
 
 ## Building images: local dev vs CI/CD
 
@@ -228,6 +291,11 @@ except RemoteExecutionError as e:
 | `local_project_root` | `Path` | required | Root directory of the project |
 | `timeout_millis` | `int` | `300000` | Default per-call timeout |
 
+Lifecycle API: `await start()`, `async with session:` (activates; owns the sandbox
+only if it wasn't started explicitly), `await pause() -> SessionRef`, `session.ref`,
+classmethod `await RemoteSession.resume(ref, backend=..., local_project_root=...)`,
+`await close()`.
+
 ### `E2B` config
 
 | Parameter | Default | Description |
@@ -258,19 +326,3 @@ except RemoteExecutionError as e:
 ### `Subprocess` config
 
 No parameters. Runs locally via `bash` + `uv run` (both must be on `PATH`).
-
-## Upgrading from 0.2.x
-
-- `BackendShell` and the `shell` config field were removed — the harness now always
-  uses `bash` (`Subprocess(shell=...)` becomes `Subprocess()`).
-- Image names gained a Dockerfile-hash suffix, so images will rebuild once on first
-  use after upgrading.
-- API keys are now Pydantic `SecretStr` (plain strings still validate; they just no
-  longer leak in reprs/logs).
-- Decorators no longer validate backends or build images at import time — builds
-  happen on first call or via `remote-box build`.
-- `RemoteExecutionError` now includes `remote_traceback`.
-
-## License
-
-MIT

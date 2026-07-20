@@ -13,7 +13,7 @@ from remote.backends import (
     RemoteExecutionProtocolError,
 )
 from remote.runtime import register_target
-from remote.session import RemoteSession
+from remote.session import RemoteSession, current_session
 
 EXECUTION_TEMPLATE = """
 import asyncio
@@ -55,11 +55,15 @@ if __name__ == "__main__":
 
 
 class RemoteFunction[I: BaseModel, O: BaseModel](Protocol):
-    """A decorated remote function: callable directly, or against a RemoteSession."""
+    """A decorated remote function.
 
-    def __call__(
-        self, arg: I, *, session: RemoteSession | None = None
-    ) -> Coroutine[Any, Any, O]: ...
+    Takes exactly the input model and nothing else — session participation is
+    ambient (via `async with session:`), never a parameter. This keeps the
+    signature reflection-clean for frameworks (e.g. AI agent SDKs) that build
+    tool schemas from it.
+    """
+
+    def __call__(self, arg: I) -> Coroutine[Any, Any, O]: ...
 
 
 def remote[I: BaseModel, O: BaseModel](
@@ -102,10 +106,10 @@ def remote[I: BaseModel, O: BaseModel](
         # One-shot (fresh sandbox per call):
         result = await my_function(InputModel(name="World"))
 
-        # Reusing one sandbox across calls:
-        async with RemoteSession(backend=..., local_project_root=...) as session:
-            await my_function(InputModel(name="a"), session=session)
-            await my_function(InputModel(name="b"), session=session)
+        # Reusing one sandbox across calls (session is picked up implicitly):
+        async with RemoteSession(backend=..., local_project_root=...):
+            await my_function(InputModel(name="a"))
+            await my_function(InputModel(name="b"))
     """
     # Record the target so `remote-box build` / build_all() can find it.
     # Deliberately no network access or builds at import time.
@@ -120,7 +124,7 @@ def remote[I: BaseModel, O: BaseModel](
         ]
 
         @functools.wraps(func)
-        async def wrapper(arg: I, *, session: RemoteSession | None = None) -> O:
+        async def wrapper(arg: I) -> O:
             # If we're already in remote execution mode, just call the function directly
             if os.environ.get("REMOTE_EXECUTION_MODE") == "1":
                 return await func(arg)
@@ -138,6 +142,10 @@ def remote[I: BaseModel, O: BaseModel](
                 arg_json=repr(arg.model_dump_json()),
             )
 
+            # Session participation is ambient-only: `async with session:` set a
+            # context var that we read here. There is deliberately no session
+            # parameter — it must never appear in the reflected signature.
+            session = current_session()
             if session is not None:
                 stdout_str = await session.run_code(python_code, timeout_millis=timeout_millis)
             else:

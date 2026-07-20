@@ -141,5 +141,40 @@ class E2BBackend:
         return result.stdout
 
     @staticmethod
+    def sandbox_id(handle: E2BHandle) -> str | None:
+        return handle.sandbox.sandbox_id
+
+    @staticmethod
+    async def pause(handle: E2BHandle) -> None:
+        # Persists both filesystem and memory state.
+        await handle.sandbox.pause()
+
+    @staticmethod
+    async def resume(handle: E2BHandle) -> None:
+        # Instance connect() auto-resumes a paused sandbox and refreshes its TTL.
+        await handle.sandbox.connect(timeout=handle.ttl_seconds)
+
+    @staticmethod
+    async def reconnect(
+        config: AnyBackendConfig,
+        sandbox_id: str | None,
+        local_project_root: Path,
+        timeout_millis: int,
+    ) -> E2BHandle:
+        if not isinstance(config, E2B):
+            raise TypeError(f"E2BBackend requires E2B config, got {type(config)}")
+        if sandbox_id is None:
+            raise ValueError("E2B reconnect requires a sandbox_id")
+
+        # Classmethod connect() reattaches by ID from any process, auto-resuming
+        # a paused sandbox.
+        sandbox = await AsyncSandbox.connect(
+            sandbox_id,
+            timeout=config.sandbox_ttl_seconds,
+            api_key=_api_key(config),
+        )
+        return E2BHandle(sandbox=sandbox, ttl_seconds=config.sandbox_ttl_seconds)
+
+    @staticmethod
     async def release(handle: E2BHandle) -> None:
         await handle.sandbox.kill()

@@ -89,7 +89,10 @@ class SubprocessBackend:
                 partial_output = f"\nPartial stdout: {stdout.decode()[:500]}\nPartial stderr: {stderr.decode()[:500]}"
             except asyncio.TimeoutError:
                 # Process didn't die quickly, force terminate and give up on partial output
-                process.terminate()
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass  # died between kill() and terminate()
                 await process.wait()
                 partial_output = ""
 
@@ -104,6 +107,29 @@ class SubprocessBackend:
             )
 
         return stdout.decode()
+
+    @staticmethod
+    def sandbox_id(handle: SubprocessHandle) -> str | None:
+        """No persistent sandbox, so nothing to reference."""
+        return None
+
+    @staticmethod
+    async def pause(handle: SubprocessHandle) -> None:
+        """Nothing to pause — processes are per-run and the local FS persists."""
+
+    @staticmethod
+    async def resume(handle: SubprocessHandle) -> None:
+        """Nothing to resume."""
+
+    @staticmethod
+    async def reconnect(
+        config: AnyBackendConfig,
+        sandbox_id: str | None,
+        local_project_root: Path,
+        timeout_millis: int,
+    ) -> SubprocessHandle:
+        """A fresh handle is equivalent — the local filesystem persisted on its own."""
+        return await SubprocessBackend.acquire(config, local_project_root, timeout_millis)
 
     @staticmethod
     async def release(handle: SubprocessHandle) -> None:

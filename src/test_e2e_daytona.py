@@ -45,14 +45,11 @@ def test_session_persists_state_across_calls():
     """Both calls hit the SAME sandbox, so call #2 sees the file from call #1."""
 
     async def scenario() -> str:
-        async with RemoteSession(backend=BACKEND, local_project_root=PROJECT_ROOT) as session:
+        async with RemoteSession(backend=BACKEND, local_project_root=PROJECT_ROOT):
             await write_file(
-                WriteRequest(path="/tmp/session_state.txt", content="written in call #1"),
-                session=session,
+                WriteRequest(path="/tmp/session_state.txt", content="written in call #1")
             )
-            result = await read_file(
-                ReadRequest(path="/tmp/session_state.txt"), session=session
-            )
+            result = await read_file(ReadRequest(path="/tmp/session_state.txt"))
             return result.content
 
     assert asyncio.run(scenario()) == "written in call #1"
@@ -71,26 +68,63 @@ def test_sessionless_calls_get_fresh_sandboxes():
 
 
 def test_separate_sessions_do_not_share_filesystem():
-    """A file written in session A is visible in A but invisible to concurrent session B."""
+    """A file written in session A is visible in A but invisible to concurrent session B.
+
+    Both sandboxes stay alive concurrently (explicit start/close); each call joins
+    a session by running inside that session's `async with` scope.
+    """
 
     async def scenario() -> str:
-        async with (
-            RemoteSession(backend=BACKEND, local_project_root=PROJECT_ROOT) as session_a,
-            RemoteSession(backend=BACKEND, local_project_root=PROJECT_ROOT) as session_b,
-        ):
-            await write_file(
-                WriteRequest(path="/tmp/isolation_state.txt", content="session A's secret"),
-                session=session_a,
-            )
-            result = await read_file(
-                ReadRequest(path="/tmp/isolation_state.txt"), session=session_a
-            )
-            assert result.content == "session A's secret"
-
-            with pytest.raises(RemoteExecutionError) as exc_info:
-                await read_file(
-                    ReadRequest(path="/tmp/isolation_state.txt"), session=session_b
+        session_a = await RemoteSession(backend=BACKEND, local_project_root=PROJECT_ROOT).start()
+        session_b = await RemoteSession(backend=BACKEND, local_project_root=PROJECT_ROOT).start()
+        try:
+            async with session_a:
+                await write_file(
+                    WriteRequest(path="/tmp/isolation_state.txt", content="session A's secret")
                 )
+                result = await read_file(ReadRequest(path="/tmp/isolation_state.txt"))
+                assert result.content == "session A's secret"
+
+            async with session_b:
+                with pytest.raises(RemoteExecutionError) as exc_info:
+                    await read_file(ReadRequest(path="/tmp/isolation_state.txt"))
             return exc_info.value.error_type
+        finally:
+            await session_a.close()
+            await session_b.close()
 
     assert asyncio.run(scenario()) == "FileNotFoundError"
+
+
+def test_pause_then_resume_from_ref_preserves_state():
+    """The agent-idle flow: write, pause, rehydrate from a serialized ref, read.
+
+    The rehydrated session is built from a JSON round-tripped SessionRef, exactly
+    as a separate process restoring persisted agent state would do it.
+    """
+    from remote import SessionRef
+
+    async def scenario() -> str:
+        session = await RemoteSession(backend=BACKEND, local_project_root=PROJECT_ROOT).start()
+        try:
+            async with session:
+                await write_file(
+                    WriteRequest(path="/tmp/paused_state.txt", content="wrote before pausing")
+                )
+            ref_json = (await session.pause()).model_dump_json()
+
+            rehydrated = await RemoteSession.resume(
+                SessionRef.model_validate_json(ref_json),
+                backend=BACKEND,
+                local_project_root=PROJECT_ROOT,
+            )
+            async with rehydrated:
+                result = await read_file(ReadRequest(path="/tmp/paused_state.txt"))
+            await rehydrated.close()
+            return result.content
+        finally:
+            # Points at the same sandbox rehydrated.close() already destroyed;
+            # release tolerates the double-delete (conflict/not-found).
+            await session.close()
+
+    assert asyncio.run(scenario()) == "wrote before pausing"
