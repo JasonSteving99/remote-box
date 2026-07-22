@@ -6,7 +6,7 @@ with type-safe inputs and outputs, including reusable sandbox sessions.
 
 from remote.decorator import remote, RemoteFunction
 from remote.session import RemoteSession, current_session
-from remote.runtime import build_all
+from remote.runtime import build_all, in_remote_execution
 from remote.backends import (
     BackendType,
     BackendConfig,
@@ -33,6 +33,8 @@ __all__ = [
     "current_session",
     # Explicit image building (CI/CD)
     "build_all",
+    # Composing other decorators with @remote
+    "in_remote_execution",
     # Backend types and configs
     "BackendType",
     "BackendConfig",

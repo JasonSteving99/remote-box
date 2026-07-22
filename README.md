@@ -155,6 +155,72 @@ Prefer pausing at genuine idle points rather than after every call — a
 pause/resume round trip costs a few seconds on the cloud backends. Daytona users
 can also set an auto-pause interval on the platform side as a safety net.
 
+## Building a sandboxed tool decorator on top of `remote-box`
+
+Agent frameworks generally want to own their own `@tool` decorator end to
+end — the user should write `@tool(sandboxed=True)` and nothing else; the
+framework decides internally that "sandboxed" means "run this on `remote-box`"
+without ever asking its users to import or apply `@remote` themselves. A
+typical `@tool` also runs its own logic *before* the tool body — a
+human-approval gate, a rate limiter, a log line — which creates one hazard
+that `remote-box` exposes a public hook for.
+
+A `@remote`-decorated call doesn't invoke the original function object
+remotely — it generates a small script that re-imports the target module by
+name *inside the sandbox* and calls whatever's bound to that name there. Since
+`@tool` applies `@remote` to the function internally, that name is `@tool`'s
+own wrapper, so the sandbox's fresh re-import re-runs `@tool`'s wrapper too —
+including the approval gate — a **second time**, remotely, where it can't
+reach a human and shouldn't run again regardless.
+
+`in_remote_execution()` is the same check `@remote` uses internally to skip
+straight to the wrapped function instead of recursing into another sandbox
+dispatch. `@tool` should do the identical thing at the very top of its own
+wrapper, before its gating logic runs — and once it does, it can call the
+*raw* undecorated function directly, skipping the `@remote` machinery
+entirely on that path:
+
+```python
+import functools
+from pathlib import Path
+from remote import remote, in_remote_execution, Daytona
+
+def tool(sandboxed: bool = False):
+    def decorator(raw_func):
+        # The user never sees or applies @remote — "sandboxed" is an internal
+        # detail of what this framework's @tool decorator does.
+        dispatch = (
+            remote(local_project_root=Path.cwd(), backend=Daytona(snapshot_name="my-agent"))(raw_func)
+            if sandboxed
+            else raw_func
+        )
+
+        @functools.wraps(raw_func)
+        async def wrapper(arg):
+            if in_remote_execution():
+                # Already inside the sandbox: the gate below already ran once
+                # on the host before @remote ever dispatched here, so run the
+                # real body directly — no gate, no re-dispatch.
+                return await raw_func(arg)
+            if sandboxed:
+                await request_human_approval(arg)
+            return await dispatch(arg)
+        return wrapper
+    return decorator
+```
+
+```python
+@tool(sandboxed=True)
+async def delete_file(input: DeleteInput) -> DeleteResult: ...
+```
+
+The end user's function is decorated exactly once, with the framework's own
+decorator; `remote-box` never appears in their code. Every framework that
+wraps `@remote` this way just needs its `@tool` wrapper to check
+`in_remote_execution()` first — the check composes regardless of how many
+such frameworks end up in the same call stack, since each one independently
+falls straight through to its inner function on the remote side.
+
 ## Building images: local dev vs CI/CD
 
 E2B templates and Daytona snapshots are built from your `Dockerfile` and cached

@@ -37,6 +37,44 @@ AUTO_BUILD_ENV_VAR = "REMOTE_BOX_AUTO_BUILD"
 _ENV_TRUE = ("1", "true", "yes", "on")
 _ENV_FALSE = ("0", "false", "no", "off")
 
+# Set by the execution harness (execution_harness.sh.tmpl) inside the sandbox only.
+REMOTE_EXECUTION_MODE_ENV_VAR = "REMOTE_EXECUTION_MODE"
+
+
+def in_remote_execution() -> bool:
+    """
+    True only inside the sandbox process spawned to run a `@remote`-decorated call.
+
+    `@remote` itself uses this to skip straight to the wrapped function instead
+    of recursing into another sandbox dispatch. It's public so any decorator
+    meant to stack with `@remote` — e.g. an AI agent framework's `@tool(...)`
+    that gates execution on human approval — can do the same: the sandbox
+    re-imports the target module from scratch, which re-runs every decorator
+    on the stack, not just `@remote`'s. Without this check, host-side gating
+    logic (approval prompts, rate limits, logging) fires again remotely, where
+    it can't actually reach a human and shouldn't re-run anyway.
+
+    Recommended pattern for a composable decorator:
+
+        def tool(sandboxed: bool = False):
+            def decorator(func):
+                @functools.wraps(func)
+                async def wrapper(arg):
+                    if in_remote_execution():
+                        return await func(arg)  # host-side gating already ran
+                    if sandboxed:
+                        await request_human_approval(arg)
+                    return await func(arg)
+                return wrapper
+            return decorator
+
+    Stacking order with `@remote` doesn't matter as long as every decorator in
+    the chain does this check: whichever one ends up outermost after the
+    sandbox's fresh re-import sees the flag first and falls straight through
+    to the next layer, cascading down to the real body with no logic re-run.
+    """
+    return os.environ.get(REMOTE_EXECUTION_MODE_ENV_VAR) == "1"
+
 
 def resolve_auto_build(config: AnyBackendConfig) -> bool:
     """

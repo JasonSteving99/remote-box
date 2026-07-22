@@ -2,7 +2,6 @@ from typing import Any, Callable, Coroutine, Protocol
 from pydantic import BaseModel, ValidationError
 import inspect
 from pathlib import Path
-import os
 import functools
 
 from remote.backends import (
@@ -12,7 +11,7 @@ from remote.backends import (
     RemoteExecutionError,
     RemoteExecutionProtocolError,
 )
-from remote.runtime import register_target
+from remote.runtime import in_remote_execution, register_target
 from remote.session import RemoteSession, current_session
 
 EXECUTION_TEMPLATE = """
@@ -126,7 +125,7 @@ def remote[I: BaseModel, O: BaseModel](
         @functools.wraps(func)
         async def wrapper(arg: I) -> O:
             # If we're already in remote execution mode, just call the function directly
-            if os.environ.get("REMOTE_EXECUTION_MODE") == "1":
+            if in_remote_execution():
                 return await func(arg)
 
             # Generate the Python program that re-imports the function and its input

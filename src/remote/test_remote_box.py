@@ -5,6 +5,7 @@ response parsing — without needing any cloud API keys.
 """
 
 import asyncio
+import functools
 import tempfile
 from datetime import datetime
 from enum import Enum
@@ -119,6 +120,112 @@ def test_decorated_signature_exposes_only_the_input_model():
 
     sig = inspect.signature(write_file, follow_wrapped=False)
     assert list(sig.parameters) == ["arg"]
+
+
+# Toy stand-in for an agent framework's own @tool(sandboxed=True) decorator
+# that applies @remote internally (the user never sees @remote at all). Must
+# live at module level, like the gated ops below, since remote-box's
+# Subprocess backend re-imports this module by name in a fresh process.
+#
+# Checking a Python-side log after the call is NOT a valid way to test this:
+# the Subprocess backend runs the gate's would-be second firing in a genuinely
+# separate OS process, so a host-side list can never observe it either way.
+# Instead the gate blocks on `_HUMAN_RESPONDED`, an asyncio.Event that only
+# this test process ever sets. A fresh sandbox process gets its own brand-new,
+# never-set copy of that Event on import — so if a decorator mistakenly runs
+# the gate again in there, it hangs until the bounded timeout below and the
+# failure surfaces as a real (if bounded) hang, not a silently-passing test.
+_HUMAN_RESPONDED = asyncio.Event()
+
+
+async def _await_human_approval() -> None:
+    """Stand-in for a real approval channel (Slack, a CLI prompt, a web UI) —
+    something only ever reachable on the host, never inside a spawned sandbox
+    process. Bounded by a short timeout so a regression fails fast instead of
+    hanging the test suite forever."""
+    await asyncio.wait_for(_HUMAN_RESPONDED.wait(), timeout=2)
+
+
+def _framework_tool(sandboxed: bool = False):
+    """Correct version: checks in_remote_execution() before gating."""
+
+    def decorator(raw_func):
+        dispatch = (
+            remote(
+                local_project_root=PROJECT_ROOT, backend=Subprocess(), timeout_millis=8000
+            )(raw_func)
+            if sandboxed
+            else raw_func
+        )
+
+        @functools.wraps(raw_func)
+        async def wrapper(arg):
+            from remote import in_remote_execution
+
+            if in_remote_execution():
+                return await raw_func(arg)
+            if sandboxed:
+                await _await_human_approval()
+            return await dispatch(arg)
+
+        return wrapper
+
+    return decorator
+
+
+def _naive_framework_tool(sandboxed: bool = False):
+    """Buggy version: no in_remote_execution() check, so the gate re-fires
+    inside the sandbox — this is exactly the bug in_remote_execution() fixes."""
+
+    def decorator(raw_func):
+        dispatch = (
+            remote(
+                local_project_root=PROJECT_ROOT, backend=Subprocess(), timeout_millis=8000
+            )(raw_func)
+            if sandboxed
+            else raw_func
+        )
+
+        @functools.wraps(raw_func)
+        async def wrapper(arg):
+            if sandboxed:
+                await _await_human_approval()
+            return await dispatch(arg)
+
+        return wrapper
+
+    return decorator
+
+
+@_framework_tool(sandboxed=True)
+async def gated_op(arg: FileOp) -> FileResult:
+    return FileResult(content=arg.content.upper())
+
+
+@_naive_framework_tool(sandboxed=True)
+async def naive_gated_op(arg: FileOp) -> FileResult:
+    return FileResult(content=arg.content.upper())
+
+
+def test_correct_tool_decorator_gate_does_not_refire_inside_sandbox():
+    """With the in_remote_execution() check, the gate only ever runs on the
+    host — the sandbox process never even touches `_HUMAN_RESPONDED`, so
+    there's nothing there to hang on."""
+    _HUMAN_RESPONDED.set()
+    result = asyncio.run(gated_op(FileOp(path="unused", content="hi")))
+    assert result.content == "HI"
+
+
+def test_naive_tool_decorator_gate_hangs_inside_sandbox():
+    """Without the check, the gate re-fires inside the freshly-imported
+    sandbox process, which gets its own never-set `_HUMAN_RESPONDED` — proving
+    the failure mode in_remote_execution() exists to prevent, via a real
+    cross-process hang (bounded by _await_human_approval's timeout) rather
+    than a same-process log that can't see into the sandbox at all."""
+    _HUMAN_RESPONDED.set()
+    with pytest.raises(RemoteExecutionError) as exc_info:
+        asyncio.run(naive_gated_op(FileOp(path="unused", content="hi")))
+    assert exc_info.value.error_type == "TimeoutError"
 
 
 def test_scope_exit_only_closes_owned_sessions():

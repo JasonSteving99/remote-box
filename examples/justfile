@@ -13,6 +13,10 @@ default:
 subprocess:
     uv run --project .. subprocess_hello.py
 
+# An agent framework's own @tool(sandboxed=True) built on remote-box internally
+tool-pattern:
+    uv run --project .. tool_framework_pattern.py
+
 # One-shot cloud sandbox example (backend: daytona | e2b)
 hello backend="daytona":
     uv run --project .. remote_hello.py --backend {{backend}}
